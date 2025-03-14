@@ -1,0 +1,305 @@
+import cv2
+import numpy as np
+import matplotlib.pyplot as plt
+import math
+import easyocr
+from skimage.transform import radon
+from deskew import determine_skew
+
+# ----------------- Preprocessing Functions -----------------
+
+def preprocess_for_ocr(img):
+    """
+    Preprocess an image for OCR enhancement:
+      1. Convert to grayscale (if needed)
+      2. Apply CLAHE for contrast enhancement
+      3. Apply bilateral filtering to reduce noise while preserving edges
+      4. Otsu's thresholding
+      5. Morphological closing to clean up the image
+      6. Unsharp masking for edge enhancement
+      7. Invert the image if necessary (to get black text on white background)
+    Returns the final processed image.
+    """
+    if len(img.shape) == 3:
+        img = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    
+    clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
+    img_clahe = clahe.apply(img)
+    
+    img_bilateral = cv2.bilateralFilter(img_clahe, 11, 17, 17)
+    
+    _, img_thresh = cv2.threshold(img_bilateral, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    
+    kernel = np.ones((2, 2), np.uint8)
+    img_morph = cv2.morphologyEx(img_thresh, cv2.MORPH_CLOSE, kernel)
+    
+    gaussian = cv2.GaussianBlur(img_morph, (0, 0), 3)
+    img_sharp = cv2.addWeighted(img_morph, 1.5, gaussian, -0.5, 0)
+    
+    white_pixel_count = np.sum(img_sharp == 255)
+    black_pixel_count = np.sum(img_sharp == 0)
+    if white_pixel_count < black_pixel_count:
+        img_final = cv2.bitwise_not(img_sharp)
+    else:
+        img_final = img_sharp
+    
+    return img_final
+
+def enhance_for_ocr(img):
+    """
+    Further enhance the OCR image:
+      - Apply erosion to thin characters
+      - Remove very small noisy contours
+      - Normalize intensity
+      - Apply gamma correction
+    Returns a dictionary of enhanced images.
+    """
+    kernel = np.ones((2, 2), np.uint8)
+    img_eroded = cv2.erode(img, kernel, iterations=1)
+    
+    cnts = cv2.findContours(img_eroded, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)[0]
+    mask = np.ones(img_eroded.shape, dtype=np.uint8) * 255
+    for c in cnts:
+        if cv2.contourArea(c) < 10:
+            cv2.drawContours(mask, [c], -1, 0, -1)
+    
+    img_cleaned = cv2.bitwise_and(img_eroded, mask)
+    
+    pxmin = np.min(img_cleaned)
+    pxmax = np.max(img_cleaned)
+    if pxmax > pxmin:
+        img_norm = ((img_cleaned - pxmin) / (pxmax - pxmin) * 255).astype(np.uint8)
+    else:
+        img_norm = img_cleaned
+    
+    gamma = 1.5
+    img_gamma = np.array(255 * (img_norm / 255) ** gamma, dtype=np.uint8)
+    
+    return {
+        'eroded': img_eroded,
+        'cleaned': img_cleaned,
+        'normalized': img_norm,
+        'gamma': img_gamma
+    }
+
+def adaptive_binarization(img):
+    """
+    Generate multiple binarized versions using different thresholding techniques.
+    Returns a dictionary of binary images.
+    """
+    _, otsu = cv2.threshold(img, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    adaptive_gaussian = cv2.adaptiveThreshold(img, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                                              cv2.THRESH_BINARY, 11, 2)
+    adaptive_mean = cv2.adaptiveThreshold(img, 255, cv2.ADAPTIVE_THRESH_MEAN_C,
+                                          cv2.THRESH_BINARY, 11, 2)
+    return {
+        'otsu': otsu,
+        'adaptive_gaussian': adaptive_gaussian,
+        'adaptive_mean': adaptive_mean
+    }
+
+def super_resolution(img):
+    """
+    Upscale and sharpen the image using cubic interpolation and a sharpening kernel.
+    Returns the upscaled, sharpened image.
+    """
+    h, w = img.shape[:2]
+    img_upscaled = cv2.resize(img, (w * 2, h * 2), interpolation=cv2.INTER_CUBIC)
+    kernel = np.array([[-1,-1,-1], [-1,9,-1], [-1,-1,-1]])
+    img_sharpened = cv2.filter2D(img_upscaled, -1, kernel)
+    return img_sharpened
+
+# ----------------- Border & Noise Removal -----------------
+
+def remove_image_borders(image, border_thickness=5):
+    """
+    Remove a fixed border (of given thickness) from all sides of the image.
+    """
+    h, w = image.shape[:2]
+    if border_thickness * 2 >= min(h, w):
+        raise ValueError("Border thickness is too large for the given image dimensions.")
+    return image[border_thickness:h - border_thickness, border_thickness:w - border_thickness]
+
+def remove_small_white_clusters(image, min_cluster_size=30):
+    """
+    Remove small white clusters from a binary image by turning them black.
+    """
+    _, binary = cv2.threshold(image, 128, 255, cv2.THRESH_BINARY)
+    contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    mask = np.ones_like(binary) * 255
+    for cnt in contours:
+        if cv2.contourArea(cnt) < min_cluster_size:
+            cv2.drawContours(mask, [cnt], -1, 0, thickness=cv2.FILLED)
+    cleaned = cv2.bitwise_and(binary, mask)
+    return cleaned
+
+# ----------------- Rotation Detection & OCR -----------------
+
+def detect_rotation_radon(image):
+    """
+    Estimate rotation angle using the Radon transform.
+    """
+    if np.mean(image) > 127:
+        image = cv2.bitwise_not(image)
+    theta = np.linspace(0., 180., max(image.shape), endpoint=False)
+    sinogram = radon(image, theta=theta, circle=True)
+    variance = np.var(sinogram, axis=0)
+    angle_est = 90 - theta[np.argmax(variance)]
+    if abs(angle_est) > 45:
+        angle_est = angle_est - 90 if angle_est > 0 else angle_est + 90
+    return angle_est
+
+def detect_rotation_moments(image):
+    """
+    Estimate rotation angle using contour moments from the largest contour.
+    """
+    _, binary = cv2.threshold(image, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours:
+        return 0
+    largest = max(contours, key=cv2.contourArea)
+    rect = cv2.minAreaRect(largest)
+    angle = rect[2]
+    if angle < -45:
+        angle = 90 + angle
+    return angle
+
+def detect_rotation_deskew(image):
+    """
+    Estimate rotation angle using the deskew library.
+    """
+    try:
+        return determine_skew(image)
+    except Exception:
+        return 0
+
+def detect_rotation_hough(image):
+    """
+    Estimate rotation angle using the Hough Lines method.
+    """
+    edges = cv2.Canny(image, 50, 150, apertureSize=3)
+    lines = cv2.HoughLinesP(edges, 1, np.pi/180, threshold=100, minLineLength=100, maxLineGap=10)
+    if lines is None:
+        return 0
+    angles = []
+    for line in lines:
+        x1, y1, x2, y2 = line[0]
+        if (x2 - x1) == 0:
+            angles.append(90)
+        else:
+            angles.append(math.degrees(math.atan2(y2 - y1, x2 - x1)))
+    if angles:
+        median_angle = np.median(angles)
+        if 45 <= median_angle <= 135:
+            return 90 - median_angle
+        elif -45 <= median_angle <= 45:
+            return -median_angle
+        elif -135 <= median_angle < -45:
+            return -90 - median_angle
+    return 0
+
+def rotate_image(image, angle):
+    """
+    Rotate the image around its center by a given angle.
+    """
+    (h, w) = image.shape[:2]
+    center = (w // 2, h // 2)
+    M = cv2.getRotationMatrix2D(center, angle, 1.0)
+    rotated = cv2.warpAffine(image, M, (w, h), flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_REPLICATE)
+    return rotated
+
+def auto_rotate_and_ocr(image):
+    """
+    Determines the best rotation angle using multiple methods,
+    applies candidate rotations, and runs EasyOCR.
+    Returns the best OCR result.
+    """
+    angles = []
+    try:
+        angles.append(detect_rotation_radon(image))
+    except Exception:
+        pass
+    try:
+        angles.append(detect_rotation_moments(image))
+    except Exception:
+        pass
+    try:
+        angles.append(detect_rotation_deskew(image))
+    except Exception:
+        pass
+    try:
+        angles.append(detect_rotation_hough(image))
+    except Exception:
+        pass
+
+    base_angle = np.median(angles) if angles else 0
+    # Candidate angles: base angle with slight variations
+    candidates = [base_angle, base_angle + 5, base_angle - 5, base_angle + 10, base_angle - 10]
+    # Normalize to range [-180, 180]
+    candidates = list(set([((a + 180) % 360) - 180 for a in candidates]))
+    
+    reader = easyocr.Reader(['en'], gpu=True)
+    best_result = {'combined_text': '', 'score': 0}
+    
+    for angle in candidates:
+        rotated = rotate_image(image, angle)
+        # Binarize for OCR
+        _, binary = cv2.threshold(rotated, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        results = reader.readtext(binary, detail=1)
+        
+        total_conf = 0
+        total_chars = 0
+        texts = []
+        for bbox, text, conf in results:
+            texts.append(text)
+            total_conf += conf * len(text)
+            total_chars += len(text)
+        avg_conf = total_conf / max(total_chars, 1)
+        combined_text = " ".join(texts)
+        score = avg_conf * total_chars
+        
+        if score > best_result['score']:
+            best_result = {
+                'angle': angle,
+                'combined_text': combined_text,
+                'score': score
+            }
+    
+    return best_result
+
+# ----------------- Main Processing Pipeline -----------------
+
+def main(image_path):
+    # Load original image (color) and convert to grayscale
+    orig = cv2.imread(image_path, cv2.IMREAD_COLOR)
+    if orig is None:
+        raise FileNotFoundError(f"Image not found at {image_path}")
+    gray = cv2.cvtColor(orig, cv2.COLOR_BGR2GRAY)
+    
+    # Step 1: Preprocess for OCR
+    preprocessed = preprocess_for_ocr(gray)
+    
+    # (Optional) Create a negative version if needed
+    negative_version = cv2.bitwise_not(preprocessed)
+    
+    # Step 2: Remove fixed borders
+    without_borders = remove_image_borders(preprocessed, border_thickness=5)
+    
+    # Step 3: Remove small white pixel clusters
+    cleaned = remove_small_white_clusters(without_borders, min_cluster_size=30)
+    
+    # (Optional) You can choose to use enhanced versions, adaptive binarization, or super resolution here.
+    # For final OCR, we use the cleaned image.
+    
+    # Step 4: Auto-rotate and perform OCR on the cleaned image
+    best_ocr = auto_rotate_and_ocr(cleaned)
+    
+    # Print the final extracted text and details
+    print("Final Extracted Text:")
+    print(best_ocr['combined_text'])
+    print(f"(Detected at rotation angle: {best_ocr.get('angle', 0):.2f}° with score {best_ocr.get('score', 0):.2f})")
+
+if __name__ == "__main__":
+    # Update the path below to point to your input image
+    image_path = "plate_104_2.png"
+    main(image_path)
