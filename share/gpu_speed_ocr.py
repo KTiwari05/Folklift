@@ -439,7 +439,7 @@ ocr_processing_active = True
 
 def process_plate_queue(reader, pattern):
     while ocr_processing_active:
-        try:
+        try: 
             plate_data = plate_frame_queue.get(timeout=1.0)
             if plate_data is None:
                 continue
@@ -569,12 +569,19 @@ def main():
     parser.add_argument("--target_fps", default=6.0, type=float)
     parser.add_argument("--debug", action="store_true", help="Display debug information")
     args = parser.parse_args()
-    try:    
-        video_info = sv.VideoInfo.from_video_path(args.source_video_path)
-    except Exception as e:
-        logging.error(f"Failed to load video: {e}")
+    
+    # Replace sv.VideoInfo with cv2.VideoCapture
+    cap = cv2.VideoCapture(args.source_video_path)
+    if not cap.isOpened():
+        logging.error("Error opening video: " + args.source_video_path)
         return
-
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    if fps <= 0:
+        fps = 30.0
+    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    resolution = (width, height)
+    
     model = YOLO("best2.pt")
     # Send YOLO model to GPU if available
     if torch.cuda.is_available():
@@ -583,16 +590,16 @@ def main():
     else:
         logging.warning("No GPU detected; using CPU")
 
-    byte_track = sv.ByteTrack(frame_rate=video_info.fps, track_activation_threshold=args.confidence_threshold)
+    byte_track = sv.ByteTrack(frame_rate=fps, track_activation_threshold=args.confidence_threshold)
     
     # Initialize speed estimator with the target FPS for consistent speed calculations
     speed_estimator = SpeedEstimator(args.target_fps)
     
-    thickness = sv.calculate_optimal_line_thickness(video_info.resolution_wh)
-    text_scale = sv.calculate_optimal_text_scale(video_info.resolution_wh)
+    thickness = sv.calculate_optimal_line_thickness(resolution)
+    text_scale = sv.calculate_optimal_text_scale(resolution)
     box_annotator = sv.BoxAnnotator(thickness=thickness)
     label_annotator = sv.LabelAnnotator(text_scale=text_scale, text_thickness=thickness, text_position=sv.Position.BOTTOM_CENTER)
-    trace_annotator = sv.TraceAnnotator(thickness=thickness, trace_length=video_info.fps * 3, position=sv.Position.BOTTOM_CENTER)
+    trace_annotator = sv.TraceAnnotator(thickness=thickness, trace_length=fps * 3, position=sv.Position.BOTTOM_CENTER)
     SOURCE = np.array([[568, 310], [1321, 330], [1600, 1002], [264, 976], [568, 310]])
     TARGET = np.array([[0, 0], [12.192, 0], [12.192, 12.192], [0, 12.192], [0, 0]])
     polygon_zone = sv.PolygonZone(polygon=SOURCE[:4])  # Use only first 4 points for polygon zone
@@ -613,10 +620,9 @@ def main():
     
     # Precise frame timing control
     ocr_skip = 5  # Process OCR more frequently (every 5th frame)
-    frame_generator = sv.get_video_frames_generator(args.source_video_path)
     
     # Calculate the number of frames to skip for target FPS
-    speed_skip = max(1, int(video_info.fps / args.target_fps))
+    speed_skip = max(1, int(fps / args.target_fps))
     frame_counter = 0
     process_time = time.time()
     target_frame_time = 1.0 / args.target_fps  # Time per frame at target FPS
@@ -627,14 +633,10 @@ def main():
 
     try:
         while True:
-            try:
-                frame = next(frame_generator)
-            except StopIteration:
+            ret, frame = cap.read()
+            if not ret:
                 break
-            
-            if frame is None:
-                break
-            
+
             frame_counter += 1
             
             # Only process and display frames at target FPS
@@ -716,6 +718,7 @@ def main():
     except Exception as e:
         logging.error(f"Error in main loop: {e}")
     finally:
+        cap.release()
         # Cleanup
         global ocr_processing_active
         ocr_processing_active = False
