@@ -19,7 +19,9 @@ import queue
 from pathlib import Path
 import torch
 import torch.backends.cudnn as cudnn
-import gc
+# Optionally set environment variables for better GPU memory allocation on Jetson Nano
+os.environ['CUDA_LAUNCH_BLOCKING'] = '1'
+os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'max_split_size_mb:32'
 
 
 class SimpleKalmanFilter:
@@ -431,7 +433,7 @@ def process_plate_job(frame, box, transformed_points, tracked_ids, pattern, read
 # -------------------------- Optimized Main Pipeline --------------------------
 
 plate_frame_queue = queue.Queue(maxsize=100)
-PLATE_SAVE_DIR = Path("c:/Users/Kartikey.Tiwari/Downloads/ForkLfit/plate_frames")
+PLATE_SAVE_DIR = Path("plate_frames")
 PLATE_SAVE_DIR.mkdir(exist_ok=True)
 ocr_processing_active = True
 
@@ -451,12 +453,8 @@ def process_plate_queue(reader, pattern):
             logging.error(f"Error in plate queue processing: {e}")
 
 def start_ocr_workers(num_workers=2):
-    # Optimize for Jetson Nano GPU
-    reader = easyocr.Reader(['en'], 
-                          gpu=True,
-                          model_storage_directory='./models',
-                          download_enabled=True,
-                          recog_network='english_g2')
+    reader = easyocr.Reader(['en'], gpu=True, model_storage_directory='./models',
+                         download_enabled=True, recog_network='english_g2')
     pattern = re.compile(r'^[0-9]{1,2}$')
     
     workers = []
@@ -469,10 +467,9 @@ def start_ocr_workers(num_workers=2):
 
 # Update these constants for better performance
 REQUIRED_CONSECUTIVE_MATCHES = 2  # Reduced from 3 for faster plate confirmation
-OCR_WORKERS = 2  # Reduced workers for Jetson Nano
-BATCH_SIZE = 2   # Smaller batch size for GPU memory
-OCR_SKIP_FRAMES = 5  # Increased skip frames to reduce GPU load
+OCR_WORKERS = max(4, os.cpu_count() - 1)  # Use more CPU cores
 OCR_CONFIDENCE_THRESHOLD = 0.4  # Reduced threshold for more plate detections
+OCR_SKIP_FRAMES = 3  # Process plates more frequently
 
 class PlateManager:
     def __init__(self):
@@ -548,14 +545,7 @@ def process_plate_variant(plate_img, preprocess, angle, reader):
     try:
         processed_img = preprocess(plate_img) if preprocess != cv2.cvtColor else preprocess(plate_img, cv2.COLOR_BGR2GRAY)
         rotated = rotate_image(processed_img, angle)
-        
-        # Optimize OCR for GPU
-        results = reader.readtext(rotated, 
-                                detail=1, 
-                                paragraph=False, 
-                                decoder='beamsearch', 
-                                batch_size=BATCH_SIZE,  # Reduced batch size
-                                allowlist='0123456789')  # Restrict to numbers only
+        results = reader.readtext(rotated, detail=1, paragraph=False, decoder='beamsearch', batch_size=8)
         
         best_result = None
         highest_confidence = 0
@@ -572,38 +562,27 @@ def process_plate_variant(plate_img, preprocess, angle, reader):
 
 def main():
     logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s: %(message)s')
-    
-    # Enable CUDA optimizations
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-        cudnn.benchmark = True
-        cudnn.deterministic = False
-        torch.cuda.set_device(0)
-        logging.info(f"Using GPU: {torch.cuda.get_device_name(0)}")
-        
-    # Set environment variables for Jetson Nano
-    os.environ['CUDA_LAUNCH_BLOCKING'] = '1'
-    os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'max_split_size_mb:32'
-    
     parser = argparse.ArgumentParser(description="Forklift Speed and Plate OCR Association")
-    parser.add_argument("source_video_path", nargs="?", default=r"C:\Users\Kartikey.Tiwari\Downloads\ForkLfit\New folder\test3plate.mp4", type=str)
+    parser.add_argument("source_video_path", nargs="?", default=r"test3plate.mp4", type=str)
     parser.add_argument("--confidence_threshold", default=0.3, type=float)
     parser.add_argument("--iou_threshold", default=0.7, type=float)
     parser.add_argument("--target_fps", default=6.0, type=float)
     parser.add_argument("--debug", action="store_true", help="Display debug information")
     args = parser.parse_args()
-    
-    try:
+    try:    
         video_info = sv.VideoInfo.from_video_path(args.source_video_path)
     except Exception as e:
         logging.error(f"Failed to load video: {e}")
         return
 
-    # Initialize model with GPU support
     model = YOLO("best2.pt")
+    # Send YOLO model to GPU if available
     if torch.cuda.is_available():
         model.cuda()
-    
+        logging.info(f"Using GPU: {torch.cuda.get_device_name(0)}")
+    else:
+        logging.warning("No GPU detected; using CPU")
+
     byte_track = sv.ByteTrack(frame_rate=video_info.fps, track_activation_threshold=args.confidence_threshold)
     
     # Initialize speed estimator with the target FPS for consistent speed calculations
@@ -614,17 +593,15 @@ def main():
     box_annotator = sv.BoxAnnotator(thickness=thickness)
     label_annotator = sv.LabelAnnotator(text_scale=text_scale, text_thickness=thickness, text_position=sv.Position.BOTTOM_CENTER)
     trace_annotator = sv.TraceAnnotator(thickness=thickness, trace_length=video_info.fps * 3, position=sv.Position.BOTTOM_CENTER)
-    
     SOURCE = np.array([[568, 310], [1321, 330], [1600, 1002], [264, 976], [568, 310]])
     TARGET = np.array([[0, 0], [12.192, 0], [12.192, 12.192], [0, 12.192], [0, 0]])
     polygon_zone = sv.PolygonZone(polygon=SOURCE[:4])  # Use only first 4 points for polygon zone
     view_transformer = ViewTransformer(source=SOURCE[:4], target=TARGET[:4])  # Use only first 4 points for transform
-    
     temp_folder = os.path.join(os.getcwd(), "temp_plates")
     os.makedirs(temp_folder, exist_ok=True)
     
     # Initialize EasyOCR outside the loop for better performance
-    reader = easyocr.Reader(['en'], gpu=False, model_storage_directory='./models',
+    reader = easyocr.Reader(['en'], gpu=True, model_storage_directory='./models',
                            download_enabled=True, recog_network='english_g2')
     
     # More permissive pattern for testing
@@ -664,18 +641,7 @@ def main():
             if frame_counter % speed_skip == 0:
                 current_process_time = time.time()
                 
-                # Clear GPU cache periodically
-                if torch.cuda.is_available() and frame_counter % 100 == 0:
-                    torch.cuda.empty_cache()
-                    gc.collect()
-                
-                # Process frame on GPU
-                if torch.cuda.is_available():
-                    frame_tensor = torch.from_numpy(frame).cuda().float() / 255.0
-                    result = model(frame_tensor, size=640)[0]  # Reduced inference size
-                else:
-                    result = model(frame)[0]
-                
+                result = model(frame)[0]
                 detections = sv.Detections.from_ultralytics(result)
                 detections = detections[detections.confidence > args.confidence_threshold]
                 
@@ -744,21 +710,12 @@ def main():
                 if frame_processing_time < target_frame_time:
                     time.sleep(target_frame_time - frame_processing_time)
                 
-                # Optimize memory usage
-                if torch.cuda.is_available():
-                    torch.cuda.synchronize()
-                    del frame_tensor
-                
             if cv2.waitKey(1) & 0xFF == ord('q'):
                 break
     
     except Exception as e:
         logging.error(f"Error in main loop: {e}")
     finally:
-        # Cleanup GPU resources
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-        
         # Cleanup
         global ocr_processing_active
         ocr_processing_active = False
@@ -767,11 +724,19 @@ def main():
             plate_frame_queue.put(None)
         for worker in ocr_workers:
             worker.join(timeout=1.0)
+        
+        # Free GPU memory if used
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        
         shutil.rmtree(str(PLATE_SAVE_DIR), ignore_errors=True)
         cv2.destroyAllWindows()
 
 if __name__ == "__main__":
-    # Set CUDA device
+    # Set the GPU device if available
     if torch.cuda.is_available():
         torch.cuda.set_device(0)
+        logging.info(f"Default GPU set: {torch.cuda.get_device_name(0)}")
+    else:
+        logging.info("Running on CPU")
     main()
