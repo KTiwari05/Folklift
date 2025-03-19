@@ -1,0 +1,106 @@
+import cv2
+import easyocr
+import os
+import re
+
+def find_base_angle(image):
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    _, binary = cv2.threshold(gray, 127, 255, cv2.THRESH_BINARY)
+    contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours:
+        return 0.0
+    largest_contour = max(contours, key=cv2.contourArea)
+    rect = cv2.minAreaRect(largest_contour)
+    angle = rect[-1]
+    if angle < -45:
+        angle = 90 + angle
+    else:
+        angle = -angle
+    return angle
+
+def rotate_image(image, angle):
+    (h, w) = image.shape[:2]
+    center = (w // 2, h // 2)
+    M = cv2.getRotationMatrix2D(center, angle, 1.0)
+    rotated = cv2.warpAffine(image, M, (w, h), flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_REPLICATE)
+    return rotated
+
+def detect_two_digit_numbers(image, reader, pattern):
+    """
+    Optimized EasyOCR call with adjusted settings for speed.
+    """
+    # batch_size = 1 for single image, decoder='greedy' is faster than beamsearch
+    results = reader.readtext(image, detail=1, paragraph=False, decoder='greedy')
+    annotated_image = image.copy()
+    valid_texts = []
+    
+    for (bbox, text, prob) in results:
+        text_clean = text.strip().replace(" ", "")
+        if pattern.match(text_clean):
+            valid_texts.append(text_clean)
+            top_left = tuple(map(int, bbox[0]))
+            bottom_right = tuple(map(int, bbox[2]))
+            cv2.rectangle(annotated_image, top_left, bottom_right, (0, 255, 0), 2)
+            cv2.putText(
+                annotated_image, text_clean,
+                (top_left[0], top_left[1] - 10),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (36, 255, 12), 2
+            )
+    return valid_texts, annotated_image
+
+def process_folder(input_folder, output_folder):
+    os.makedirs(output_folder, exist_ok=True)
+    images_out_folder = os.path.join(output_folder, "images")
+    text_out_folder = os.path.join(output_folder, "text")
+    os.makedirs(images_out_folder, exist_ok=True)
+    os.makedirs(text_out_folder, exist_ok=True)
+    
+    reader = easyocr.Reader(['en'], gpu=True, verbose=False)
+    pattern = re.compile(r'^(0[1-9]|[1-6]\d|70)$')
+    
+    for filename in os.listdir(input_folder):
+        if filename.lower().endswith(('.png', '.jpg', '.jpeg', '.bmp', '.tiff')):
+            image_path = os.path.join(input_folder, filename)
+            original_image = cv2.imread(image_path)
+            if original_image is None:
+                print(f"Warning: Could not read {image_path}")
+                continue
+
+            base_angle = find_base_angle(original_image)
+            angle_offsets = [-10, -5, 0, 5, 10]  # Reduced angles to speed up
+
+            best_texts = []
+            best_annotated = None
+            best_angle = None
+
+            for offset in angle_offsets:
+                test_angle = base_angle + offset
+                rotated = rotate_image(original_image, test_angle)
+                valid_texts, annotated = detect_two_digit_numbers(rotated, reader, pattern)
+                
+                if len(valid_texts) > len(best_texts):
+                    best_texts = valid_texts
+                    best_annotated = annotated
+                    best_angle = test_angle
+
+                # Early stop if we already detected enough
+                if len(best_texts) >= 2:
+                    break
+
+            if best_annotated is not None:
+                output_image_path = os.path.join(images_out_folder, f"detected_{filename}")
+                cv2.imwrite(output_image_path, best_annotated)
+                output_text_path = os.path.join(text_out_folder, f"{os.path.splitext(filename)[0]}.txt")
+                with open(output_text_path, "w", encoding="utf-8") as f:
+                    for t in best_texts:
+                        f.write(f"{t}\n")
+                print(f"Processed {filename} -> Best angle: {best_angle}, digits found: {best_texts}")
+            else:
+                print(f"Processed {filename}, but no valid digits found.")
+
+    print("Batch processing complete.")
+
+if __name__ == "__main__":
+    input_folder = r"final_output"
+    output_folder = r"ocr_output"
+    process_folder(input_folder, output_folder)
