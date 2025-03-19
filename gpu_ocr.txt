@@ -4,16 +4,14 @@ import numpy as np
 import logging
 import re
 import easyocr
+from ultralytics import YOLO
 from skimage import exposure
-import tensorrt as trt
-import pycuda.driver as cuda
-import pycuda.autoinit
 
-# ----------------------------------------------------------------------
-#                          PREPROCESS CODE
-# ----------------------------------------------------------------------
 
 MORPH_KERNEL = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+
+# Global variable to store final plate number
+final_plate_number = None
 
 def order_points(pts):
     rect = np.zeros((4, 2), dtype="float32")
@@ -138,15 +136,36 @@ def quick_precheck(plate_crop, precheck_white_ratio=0.1):
     ratio = white_pixels / total_pixels
     return ratio > precheck_white_ratio
 
+def find_frequent_element(li):
+    count = {}
+    mode = None
+    max_count = 0
+
+    # Count occurrences of each element
+    for item in li:
+        count[item] = count.get(item, 0) + 1
+        if count[item] > max_count:
+            max_count = count[item]
+            mode = item
+
+    # Check if the most frequent element appears at least 3 times
+    if max_count >= 3:
+        return mode
+    else:
+        return 0
+
+
 # ----------------------------------------------------------------------
 #                          EASYOCR CODE
 # ----------------------------------------------------------------------
 
 def find_base_angle(image):
+    # Check if already grayscale
     if len(image.shape) == 2 or image.shape[2] == 1:
         gray = image
     else:
         gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+
     _, binary = cv2.threshold(gray, 127, 255, cv2.THRESH_BINARY)
     contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     if not contours:
@@ -171,6 +190,7 @@ def detect_two_digit_numbers(image, reader, pattern):
     results = reader.readtext(image, detail=1, paragraph=False, decoder='greedy')
     annotated_image = image.copy()
     valid_texts = []
+    
     for (bbox, text, prob) in results:
         text_clean = text.strip().replace(" ", "")
         if pattern.match(text_clean):
@@ -185,124 +205,21 @@ def detect_two_digit_numbers(image, reader, pattern):
             )
     return valid_texts, annotated_image
 
-# ----------------------------------------------------------------------
-#                 YOLOTRT WRAPPER (TensorRT .engine)
-# ----------------------------------------------------------------------
-
-TRT_LOGGER = trt.Logger(trt.Logger.INFO)
-
-def load_engine(engine_file_path):
-    with open(engine_file_path, "rb") as f, trt.Runtime(TRT_LOGGER) as runtime:
-        return runtime.deserialize_cuda_engine(f.read())
-
-# These simple container classes mimic the ultralytics API
-class Boxes:
-    def __init__(self, xyxy, cls):
-        self.xyxy = xyxy  # numpy array with shape (N, 4)
-        self.cls = cls    # numpy array with shape (N,)
-
-class DetectionResult:
-    def __init__(self, boxes):
-        self.boxes = boxes
-
-class YOLOTRT:
-    def __init__(self, engine_path, input_shape=(3, 640, 640)):
-        self.engine = load_engine(engine_path)
-        self.context = self.engine.create_execution_context()
-        self.input_shape = input_shape  # (C, H, W) = (3, 640, 640)
-        self.batch_size = 1
-        self.inputs, self.outputs, self.bindings, self.stream = self.allocate_buffers()
-    
-    def allocate_buffers(self):
-        inputs = []
-        outputs = []
-        bindings = []
-        stream = cuda.Stream()
-        for binding in self.engine:
-            shape = self.engine.get_binding_shape(binding)
-            # Replace dynamic dimensions (-1) with the batch size
-            shape = [self.batch_size if s == -1 else s for s in shape]
-            size = trt.volume(shape)
-            dtype = trt.nptype(self.engine.get_binding_dtype(binding))
-            host_mem = cuda.pagelocked_empty(size, dtype)
-            device_mem = cuda.mem_alloc(host_mem.nbytes)
-            bindings.append(int(device_mem))
-            if self.engine.binding_is_input(binding):
-                inputs.append({"host": host_mem, "device": device_mem, "shape": shape})
-            else:
-                outputs.append({"host": host_mem, "device": device_mem, "shape": shape})
-        return inputs, outputs, bindings, stream
-    
-    def preprocess(self, image):
-        # Resize with letterboxing to maintain aspect ratio for a 640x640 input
-        _, H, W = self.input_shape  # (3, 640, 640)
-        h, w, _ = image.shape
-        scale = min(W / w, H / h)
-        new_w, new_h = int(w * scale), int(h * scale)
-        resized = cv2.resize(image, (new_w, new_h))
-        canvas = np.full((H, W, 3), 114, dtype=np.uint8)
-        top = (H - new_h) // 2
-        left = (W - new_w) // 2
-        canvas[top:top+new_h, left:left+new_w] = resized
-        img = canvas.astype(np.float32) / 255.0
-        img = np.transpose(img, (2, 0, 1))  # to CHW
-        img = np.expand_dims(img, axis=0)    # add batch dimension
-        return img, scale, top, left
-    
-    def infer(self, image):
-        input_image, scale, top, left = self.preprocess(image)
-        np.copyto(self.inputs[0]["host"], input_image.ravel())
-        self.context.execute_async_v2(bindings=self.bindings, stream_handle=self.stream.handle)
-        for out in self.outputs:
-            cuda.memcpy_dtoh_async(out["host"], out["device"], self.stream)
-        self.stream.synchronize()
-        output = self.outputs[0]["host"]
-        # Assuming the output is an array of detections in the format:
-        # [x1, y1, x2, y2, conf, class] for each detection
-        detections = np.array(output).reshape(-1, 6)
-        conf_thresh = 0.5
-        detections = detections[detections[:, 4] > conf_thresh]
-        h, w, _ = image.shape
-        if detections.shape[0] > 0:
-            detections[:, [0, 2]] = (detections[:, [0, 2]] - left) / scale
-            detections[:, [1, 3]] = (detections[:, [1, 3]] - top) / scale
-            detections[:, [0, 2]] = np.clip(detections[:, [0, 2]], 0, w)
-            detections[:, [1, 3]] = np.clip(detections[:, [1, 3]], 0, h)
-        return detections
-
-    def __call__(self, image):
-        # This allows you to use the model as: results = model(image)
-        detections = self.infer(image)
-        if detections.size == 0:
-            # No detections found; return empty list
-            return []
-        # Build a simple container mimicking ultralytics output
-        xyxy = detections[:, :4]
-        cls = detections[:, 5].astype(int)
-        boxes = Boxes(xyxy=xyxy, cls=cls)
-        result = DetectionResult(boxes)
-        return [result]
 
 # ----------------------------------------------------------------------
 #                          MAIN VIDEO LOOP
 # ----------------------------------------------------------------------
 
 def main():
+    global final_plate_number
     logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s: %(message)s')
+    plate = []  # List to track detected numbers
     
-    # Update these paths as neededss
+    # Inputs/Outputs
     video_path = r"test3plate.mp4"
-    output_dir = r"ocr_output"
-    os.makedirs(output_dir, exist_ok=True)
     
-    ocr_images_dir = os.path.join(output_dir, "images")
-    ocr_texts_dir = os.path.join(output_dir, "text")
-    os.makedirs(ocr_images_dir, exist_ok=True)
-    os.makedirs(ocr_texts_dir, exist_ok=True)
-    
-    # Load the TensorRT engine (best2.engine) and EasyOCR
-    model = YOLO("best2.engine", input_shape=(3, 640, 640))
-    reader = easyocr.Reader(['en'], gpu=True )
+    model = YOLO("best2.engine")
+    reader = easyocr.Reader(['en'], gpu=True)
     pattern = re.compile(r'^(0[1-9]|[1-6]\d|70)$')
     
     cap = cv2.VideoCapture(video_path)
@@ -311,36 +228,43 @@ def main():
         return
 
     frame_count = 0
-    saved_ocr_count = 0
     frame_skip = 15
 
     while True:
+        # Check if we've already found a plate number with high confidence
+        if final_plate_number is not None:
+            logging.info(f"Plate number {final_plate_number} detected with high confidence. Stopping processing.")
+            break
+            
         ret, frame = cap.read()
         if not ret:
             break
         
+        # Optionally skip frames for speed
         if frame_count % frame_skip != 0:
             frame_count += 1
             continue
 
+        # 1) Mask the frame so YOLO only sees your polygon region
         masked_frame = apply_polygon_mask(frame)
         
-        # Run inference using the TensorRT engine via our YOLOTRT wrapper
+        # 2) Run YOLO detection on masked frame
         results = model(masked_frame)
-        # results is a list (mimicking ultralytics), iterate through each detection result
         for result in results:
-            # Mimic the ultralytics API: result.boxes.xyxy and result.boxes.cls
             boxes = result.boxes.xyxy
-            class_ids = result.boxes.cls.tolist()
-            
+            class_ids = result.boxes.cls.int().tolist()
+
             for i, box in enumerate(boxes):
                 if class_ids[i] == 1:  # Plate class
                     box_int = list(map(int, box))
+                    
+                    # Safety check: ensure center of box is inside polygon
                     cx = (box_int[0] + box_int[2]) // 2
                     cy = (box_int[1] + box_int[3]) // 2
                     if cv2.pointPolygonTest(POLYGON, (cx, cy), False) < 0:
                         continue
                     
+                    # 3) Extract & pre-check
                     plate_crop = extract_plate(frame, box_int, margin=0.2)
                     if plate_crop is None:
                         continue
@@ -348,7 +272,10 @@ def main():
                         logging.info(f"Quick-skip frame {frame_count}_{i} due to low white pixel content.")
                         continue
                     
+                    # 4) Full preprocessing
                     final_processed = full_preprocess_pipeline(plate_crop)
+
+                    # 5) Now run EasyOCR multi-angle approach
                     base_angle = find_base_angle(final_processed)
                     angle_offsets = [-10, -5, 0, 5, 10]
                     best_texts = []
@@ -359,33 +286,40 @@ def main():
                         test_angle = base_angle + offset
                         rotated = rotate_image(final_processed, test_angle)
                         valid_texts, annotated = detect_two_digit_numbers(rotated, reader, pattern)
+
                         if len(valid_texts) > len(best_texts):
                             best_texts = valid_texts
                             best_annotated = annotated
                             best_angle = test_angle
+
+                        # Early stopping if you want
                         if len(best_texts) >= 2:
                             break
                     
+                    # 6) If we found any valid digits, update our tracking
                     if best_annotated is not None and len(best_texts) > 0:
-                        ocr_image_name = f"ocr_frame{frame_count:06d}_plate{i}_angle{best_angle}.png"
-                        ocr_image_path = os.path.join(ocr_images_dir, ocr_image_name)
-                        cv2.imwrite(ocr_image_path, best_annotated)
-
-                        ocr_text_name = f"ocr_frame{frame_count:06d}_plate{i}.txt"
-                        ocr_text_path = os.path.join(ocr_texts_dir, ocr_text_name)
-                        with open(ocr_text_path, "w", encoding="utf-8") as f:
-                            for t in best_texts:
-                                f.write(f"{t}\n")
-
-                        logging.info(f"[OCR] Frame={frame_count}, Plate#{i}, Angle={best_angle}, Digits={best_texts}")
-                        saved_ocr_count += 1
+                        # Add recognized digits to our plate list
+                        for text in best_texts:
+                            plate.append(text)
+                        
+                        # Check if we have a frequent element (3+ occurrences)
+                        frequent_result = find_frequent_element(plate)
+                        
+                        if frequent_result != 0:
+                            # We found our plate number! Store it and prepare to stop
+                            final_plate_number = frequent_result
+                            logging.info(f"PLATE NUMBER DETECTED: {final_plate_number}")
+                            break
+                        
+                        logging.info(f"[OCR] Frame={frame_count}, Detected={best_texts}, Current list={plate}")
                     else:
-                        logging.info(f"[NO DIGITS] Frame={frame_count}, Plate#{i}")
+                        logging.info(f"[NO DIGITS] Frame={frame_count}")
 
         frame_count += 1
 
     cap.release()
-    logging.info(f"Completed! Saved {saved_ocr_count} OCR results from video frames.")
+    logging.info(f"Final plate number: {final_plate_number}")
+    return final_plate_number
 
 if __name__ == "__main__":
     main()
