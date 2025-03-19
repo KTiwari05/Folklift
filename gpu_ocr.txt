@@ -1,0 +1,363 @@
+import cv2
+import os
+import numpy as np
+import logging
+import re
+import easyocr
+from skimage import exposure
+import tensorrt as trt
+import pycuda.driver as cuda
+import pycuda.autoinit
+
+# ----------------------------------------------------------------------
+#                          PREPROCESS CODE
+# ----------------------------------------------------------------------
+
+MORPH_KERNEL = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+
+def order_points(pts):
+    rect = np.zeros((4, 2), dtype="float32")
+    s = pts.sum(axis=1)
+    rect[0] = pts[np.argmin(s)]
+    rect[2] = pts[np.argmax(s)]
+    diff = np.diff(pts, axis=1)
+    rect[1] = pts[np.argmin(diff)]
+    rect[3] = pts[np.argmax(diff)]
+    return rect
+
+def extract_plate(image, box, margin=0.2):
+    try:
+        x1, y1, x2, y2 = box
+        h, w = image.shape[:2]
+        box_w, box_h = x2 - x1, y2 - y1
+        aspect_ratio = box_w / box_h if box_h != 0 else 0
+        if 2.0 < aspect_ratio < 6.0:
+            margin *= 1.2
+        dx = int(margin * box_w)
+        dy = int(margin * box_h)
+        x1e, y1e = max(0, x1 - dx), max(0, y1 - dy)
+        x2e, y2e = min(w, x2 + dx), min(h, y2 + dy)
+        crop = image[y1e:y2e, x1e:x2e]
+        return crop
+    except Exception as e:
+        logging.error(f"Plate extraction failed: {e}")
+        return None
+
+# Coordinates for your polygon region
+POLYGON = np.array([[726,466], [1255,474], [1403,1046], [600, 1057]], dtype=np.int32)
+
+def apply_polygon_mask(frame):
+    mask = np.zeros(frame.shape[:2], dtype=np.uint8)
+    cv2.fillPoly(mask, [POLYGON], 255)
+    masked_frame = cv2.bitwise_and(frame, frame, mask=mask)
+    return masked_frame
+
+def denoise_image(image):
+    return cv2.fastNlMeansDenoisingColored(image, None, 10, 10, 7, 21)
+
+def adjust_gamma(image):
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    brightness = np.mean(gray)
+    gamma = 0.8 if brightness < 100 else 1.2 if brightness > 150 else 1.0
+    return exposure.adjust_gamma(image, gamma)
+
+def enhance_image_colors(image):
+    lab_image = cv2.cvtColor(image, cv2.COLOR_BGR2LAB)
+    l, a, b = cv2.split(lab_image)
+    clahe = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(8,8))
+    l = clahe.apply(l)
+    a = cv2.equalizeHist(a)
+    b = cv2.equalizeHist(b)
+    lab_image = cv2.merge([l, a, b])
+    return cv2.cvtColor(lab_image, cv2.COLOR_LAB2BGR)
+
+def remove_white_pixels(image):
+    hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
+    lower_white = np.array([0, 0, 180], dtype=np.uint8)
+    upper_white = np.array([180, 50, 255], dtype=np.uint8)
+    white_mask = cv2.inRange(hsv, lower_white, upper_white)
+    non_white_mask = cv2.bitwise_not(white_mask)
+    filtered_image = cv2.bitwise_and(image, image, mask=non_white_mask)
+    kernel = np.ones((3,3), np.uint8)
+    return cv2.morphologyEx(filtered_image, cv2.MORPH_CLOSE, kernel)
+
+def adaptive_thresholding(image):
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    bilateral = cv2.bilateralFilter(gray, 9, 75, 75)
+    thresh = cv2.adaptiveThreshold(
+        bilateral, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+        cv2.THRESH_BINARY_INV, 19, 9
+    )
+    kernel = np.ones((3,3), np.uint8)
+    cleaned = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, kernel)
+    num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(cleaned, connectivity=8)
+    height, width = cleaned.shape
+    center_y, center_x = height // 2, width // 2
+    min_size = 100
+    max_distance = width // 4
+    result = np.zeros_like(cleaned)
+    for i in range(1, num_labels):
+        size = stats[i, cv2.CC_STAT_AREA]
+        cx, cy = centroids[i]
+        distance = np.sqrt((cx - center_x)**2 + (cy - center_y)**2)
+        if size > min_size and distance < max_distance:
+            result[labels == i] = 255
+    return result
+
+def sharpen_image(image):
+    kernel = np.array([[0, -1,  0],
+                       [-1,  5, -1],
+                       [0, -1,  0]], dtype=np.float32)
+    return cv2.filter2D(image, -1, kernel)
+
+def fill_black_holes(binary_image):
+    if len(binary_image.shape) == 3:
+        binary_image = cv2.cvtColor(binary_image, cv2.COLOR_BGR2GRAY)
+    _, binary = cv2.threshold(binary_image, 127, 255, cv2.THRESH_BINARY)
+    kernel = np.ones((3, 3), np.uint8)
+    closed = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel)
+    dilated = cv2.dilate(closed, kernel, iterations=0)
+    return dilated
+
+def full_preprocess_pipeline(plate_image):
+    denoised = denoise_image(plate_image)
+    gamma_corrected = adjust_gamma(denoised)
+    enhanced = enhance_image_colors(gamma_corrected)
+    filtered = remove_white_pixels(enhanced)
+    thresholded = adaptive_thresholding(filtered)
+    sharpened = sharpen_image(thresholded)
+    final = fill_black_holes(sharpened)
+    return final
+
+# Quick check if the raw plate is too blank
+def quick_precheck(plate_crop, precheck_white_ratio=0.1):
+    gray = cv2.cvtColor(plate_crop, cv2.COLOR_BGR2GRAY)
+    _, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    white_pixels = cv2.countNonZero(binary)
+    total_pixels = binary.shape[0] * binary.shape[1]
+    ratio = white_pixels / total_pixels
+    return ratio > precheck_white_ratio
+
+# ----------------------------------------------------------------------
+#                          EASYOCR CODE
+# ----------------------------------------------------------------------
+
+def find_base_angle(image):
+    if len(image.shape) == 2 or image.shape[2] == 1:
+        gray = image
+    else:
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    _, binary = cv2.threshold(gray, 127, 255, cv2.THRESH_BINARY)
+    contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours:
+        return 0.0
+    largest_contour = max(contours, key=cv2.contourArea)
+    rect = cv2.minAreaRect(largest_contour)
+    angle = rect[-1]
+    if angle < -45:
+        angle = 90 + angle
+    else:
+        angle = -angle
+    return angle
+
+def rotate_image(image, angle):
+    (h, w) = image.shape[:2]
+    center = (w // 2, h // 2)
+    M = cv2.getRotationMatrix2D(center, angle, 1.0)
+    rotated = cv2.warpAffine(image, M, (w, h), flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_REPLICATE)
+    return rotated
+
+def detect_two_digit_numbers(image, reader, pattern):
+    results = reader.readtext(image, detail=1, paragraph=False, decoder='greedy')
+    annotated_image = image.copy()
+    valid_texts = []
+    for (bbox, text, prob) in results:
+        text_clean = text.strip().replace(" ", "")
+        if pattern.match(text_clean):
+            valid_texts.append(text_clean)
+            top_left = tuple(map(int, bbox[0]))
+            bottom_right = tuple(map(int, bbox[2]))
+            cv2.rectangle(annotated_image, top_left, bottom_right, (0, 255, 0), 2)
+            cv2.putText(
+                annotated_image, text_clean,
+                (top_left[0], top_left[1] - 10),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (36, 255, 12), 2
+            )
+    return valid_texts, annotated_image
+
+# ----------------------------------------------------------------------
+#                      TENSORRT YOLO INFERENCE CODE
+# ----------------------------------------------------------------------
+
+TRT_LOGGER = trt.Logger(trt.Logger.INFO)
+
+def load_engine(engine_file_path):
+    with open(engine_file_path, "rb") as f, trt.Runtime(TRT_LOGGER) as runtime:
+        return runtime.deserialize_cuda_engine(f.read())
+
+class YoLOTRT:
+    def __init__(self, engine_path, input_shape=(3, 640, 640)):
+        self.engine = load_engine(engine_path)
+        self.context = self.engine.create_execution_context()
+        self.input_shape = input_shape
+        self.batch_size = 1
+        self.inputs, self.outputs, self.bindings, self.stream = self.allocate_buffers()
+    
+    def allocate_buffers(self):
+        inputs = []
+        outputs = []
+        bindings = []
+        stream = cuda.Stream()
+        for binding in self.engine:
+            shape = self.engine.get_binding_shape(binding)
+            # Replace -1 with batch size if needed
+            shape = [self.batch_size if s==-1 else s for s in shape]
+            size = trt.volume(shape)
+            dtype = trt.nptype(self.engine.get_binding_dtype(binding))
+            host_mem = cuda.pagelocked_empty(size, dtype)
+            device_mem = cuda.mem_alloc(host_mem.nbytes)
+            bindings.append(int(device_mem))
+            if self.engine.binding_is_input(binding):
+                inputs.append({"host": host_mem, "device": device_mem, "shape": shape})
+            else:
+                outputs.append({"host": host_mem, "device": device_mem, "shape": shape})
+        return inputs, outputs, bindings, stream
+    
+    def preprocess(self, image):
+        # Resize image with letterbox to self.input_shape
+        _, H, W = self.input_shape
+        h, w, _ = image.shape
+        scale = min(W/w, H/h)
+        new_w, new_h = int(w * scale), int(h * scale)
+        resized = cv2.resize(image, (new_w, new_h))
+        canvas = np.full((H, W, 3), 114, dtype=np.uint8)
+        top = (H - new_h) // 2
+        left = (W - new_w) // 2
+        canvas[top:top+new_h, left:left+new_w] = resized
+        img = canvas.astype(np.float32) / 255.0
+        img = np.transpose(img, (2, 0, 1))
+        img = np.expand_dims(img, axis=0)
+        return img, scale, top, left
+    
+    def infer(self, image):
+        input_image, scale, top, left = self.preprocess(image)
+        np.copyto(self.inputs[0]["host"], input_image.ravel())
+        self.context.execute_async_v2(bindings=self.bindings, stream_handle=self.stream.handle)
+        for out in self.outputs:
+            cuda.memcpy_dtoh_async(out["host"], out["device"], self.stream)
+        self.stream.synchronize()
+        output = self.outputs[0]["host"]
+        # Assume output shape is (num_detections, 6): [x1, y1, x2, y2, conf, class]
+        detections = np.array(output).reshape(-1, 6)
+        conf_thresh = 0.5
+        detections = detections[detections[:, 4] > conf_thresh]
+        h, w, _ = image.shape
+        if detections.shape[0] > 0:
+            detections[:, [0,2]] = (detections[:, [0,2]] - left) / scale
+            detections[:, [1,3]] = (detections[:, [1,3]] - top) / scale
+            detections[:, [0,2]] = np.clip(detections[:, [0,2]], 0, w)
+            detections[:, [1,3]] = np.clip(detections[:, [1,3]], 0, h)
+        return detections
+
+# ----------------------------------------------------------------------
+#                          MAIN VIDEO LOOP
+# ----------------------------------------------------------------------
+
+def main():
+    logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s: %(message)s')
+    
+    # Inputs/Outputs – update these paths as needed
+    video_path = r"test3plate.mp4"
+    output_dir = r"ocr_output"
+    os.makedirs(output_dir, exist_ok=True)
+    
+    ocr_images_dir = os.path.join(output_dir, "images")
+    ocr_texts_dir = os.path.join(output_dir, "text")
+    os.makedirs(ocr_images_dir, exist_ok=True)
+    os.makedirs(ocr_texts_dir, exist_ok=True)
+    
+    # Load TensorRT YOLO engine and EasyOCR
+    model = YoLOTRT("best2.engine", input_shape=(3, 640, 640))
+    reader = easyocr.Reader(['en'], gpu=True)
+    pattern = re.compile(r'^(0[1-9]|[1-6]\d|70)$')
+    
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        logging.error("Unable to open video file.")
+        return
+
+    frame_count = 0
+    saved_ocr_count = 0
+    frame_skip = 15
+
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            break
+        
+        if frame_count % frame_skip != 0:
+            frame_count += 1
+            continue
+
+        masked_frame = apply_polygon_mask(frame)
+        
+        # Run TensorRT YOLO inference on the masked frame
+        detections = model.infer(masked_frame)
+        for i, det in enumerate(detections):
+            x1, y1, x2, y2, conf, cls = det
+            if int(cls) == 1:  # Plate class
+                box_int = [int(x1), int(y1), int(x2), int(y2)]
+                # Safety check: ensure box center is within the polygon
+                cx = (box_int[0] + box_int[2]) // 2
+                cy = (box_int[1] + box_int[3]) // 2
+                if cv2.pointPolygonTest(POLYGON, (cx, cy), False) < 0:
+                    continue
+                
+                plate_crop = extract_plate(frame, box_int, margin=0.2)
+                if plate_crop is None:
+                    continue
+                if not quick_precheck(plate_crop, precheck_white_ratio=0.01):
+                    logging.info(f"Quick-skip frame {frame_count}_{i} due to low white pixel content.")
+                    continue
+                
+                final_processed = full_preprocess_pipeline(plate_crop)
+                base_angle = find_base_angle(final_processed)
+                angle_offsets = [-10, -5, 0, 5, 10]
+                best_texts = []
+                best_annotated = None
+                best_angle = None
+
+                for offset in angle_offsets:
+                    test_angle = base_angle + offset
+                    rotated = rotate_image(final_processed, test_angle)
+                    valid_texts, annotated = detect_two_digit_numbers(rotated, reader, pattern)
+                    if len(valid_texts) > len(best_texts):
+                        best_texts = valid_texts
+                        best_annotated = annotated
+                        best_angle = test_angle
+                    if len(best_texts) >= 2:
+                        break
+                
+                if best_annotated is not None and len(best_texts) > 0:
+                    ocr_image_name = f"ocr_frame{frame_count:06d}_plate{i}_angle{best_angle}.png"
+                    ocr_image_path = os.path.join(ocr_images_dir, ocr_image_name)
+                    cv2.imwrite(ocr_image_path, best_annotated)
+
+                    ocr_text_name = f"ocr_frame{frame_count:06d}_plate{i}.txt"
+                    ocr_text_path = os.path.join(ocr_texts_dir, ocr_text_name)
+                    with open(ocr_text_path, "w", encoding="utf-8") as f:
+                        for t in best_texts:
+                            f.write(f"{t}\n")
+
+                    logging.info(f"[OCR] Frame={frame_count}, Plate#{i}, Angle={best_angle}, Digits={best_texts}")
+                    saved_ocr_count += 1
+                else:
+                    logging.info(f"[NO DIGITS] Frame={frame_count}, Plate#{i}")
+
+        frame_count += 1
+
+    cap.release()
+    logging.info(f"Completed! Saved {saved_ocr_count} OCR results from video frames.")
+
+if __name__ == "__main__":
+    main()
