@@ -186,7 +186,7 @@ def detect_two_digit_numbers(image, reader, pattern):
     return valid_texts, annotated_image
 
 # ----------------------------------------------------------------------
-#                      TENSORRT YOLO INFERENCE CODE
+#                 YOLOTRT WRAPPER (TensorRT .engine)
 # ----------------------------------------------------------------------
 
 TRT_LOGGER = trt.Logger(trt.Logger.INFO)
@@ -195,11 +195,21 @@ def load_engine(engine_file_path):
     with open(engine_file_path, "rb") as f, trt.Runtime(TRT_LOGGER) as runtime:
         return runtime.deserialize_cuda_engine(f.read())
 
-class YoLOTRT:
+# These simple container classes mimic the ultralytics API
+class Boxes:
+    def __init__(self, xyxy, cls):
+        self.xyxy = xyxy  # numpy array with shape (N, 4)
+        self.cls = cls    # numpy array with shape (N,)
+
+class DetectionResult:
+    def __init__(self, boxes):
+        self.boxes = boxes
+
+class YOLOTRT:
     def __init__(self, engine_path, input_shape=(3, 640, 640)):
         self.engine = load_engine(engine_path)
         self.context = self.engine.create_execution_context()
-        self.input_shape = input_shape
+        self.input_shape = input_shape  # (C, H, W) = (3, 640, 640)
         self.batch_size = 1
         self.inputs, self.outputs, self.bindings, self.stream = self.allocate_buffers()
     
@@ -210,8 +220,8 @@ class YoLOTRT:
         stream = cuda.Stream()
         for binding in self.engine:
             shape = self.engine.get_binding_shape(binding)
-            # Replace -1 with batch size if needed
-            shape = [self.batch_size if s==-1 else s for s in shape]
+            # Replace dynamic dimensions (-1) with the batch size
+            shape = [self.batch_size if s == -1 else s for s in shape]
             size = trt.volume(shape)
             dtype = trt.nptype(self.engine.get_binding_dtype(binding))
             host_mem = cuda.pagelocked_empty(size, dtype)
@@ -224,10 +234,10 @@ class YoLOTRT:
         return inputs, outputs, bindings, stream
     
     def preprocess(self, image):
-        # Resize image with letterbox to self.input_shape
-        _, H, W = self.input_shape
+        # Resize with letterboxing to maintain aspect ratio for a 640x640 input
+        _, H, W = self.input_shape  # (3, 640, 640)
         h, w, _ = image.shape
-        scale = min(W/w, H/h)
+        scale = min(W / w, H / h)
         new_w, new_h = int(w * scale), int(h * scale)
         resized = cv2.resize(image, (new_w, new_h))
         canvas = np.full((H, W, 3), 114, dtype=np.uint8)
@@ -235,8 +245,8 @@ class YoLOTRT:
         left = (W - new_w) // 2
         canvas[top:top+new_h, left:left+new_w] = resized
         img = canvas.astype(np.float32) / 255.0
-        img = np.transpose(img, (2, 0, 1))
-        img = np.expand_dims(img, axis=0)
+        img = np.transpose(img, (2, 0, 1))  # to CHW
+        img = np.expand_dims(img, axis=0)    # add batch dimension
         return img, scale, top, left
     
     def infer(self, image):
@@ -247,17 +257,31 @@ class YoLOTRT:
             cuda.memcpy_dtoh_async(out["host"], out["device"], self.stream)
         self.stream.synchronize()
         output = self.outputs[0]["host"]
-        # Assume output shape is (num_detections, 6): [x1, y1, x2, y2, conf, class]
+        # Assuming the output is an array of detections in the format:
+        # [x1, y1, x2, y2, conf, class] for each detection
         detections = np.array(output).reshape(-1, 6)
         conf_thresh = 0.5
         detections = detections[detections[:, 4] > conf_thresh]
         h, w, _ = image.shape
         if detections.shape[0] > 0:
-            detections[:, [0,2]] = (detections[:, [0,2]] - left) / scale
-            detections[:, [1,3]] = (detections[:, [1,3]] - top) / scale
-            detections[:, [0,2]] = np.clip(detections[:, [0,2]], 0, w)
-            detections[:, [1,3]] = np.clip(detections[:, [1,3]], 0, h)
+            detections[:, [0, 2]] = (detections[:, [0, 2]] - left) / scale
+            detections[:, [1, 3]] = (detections[:, [1, 3]] - top) / scale
+            detections[:, [0, 2]] = np.clip(detections[:, [0, 2]], 0, w)
+            detections[:, [1, 3]] = np.clip(detections[:, [1, 3]], 0, h)
         return detections
+
+    def __call__(self, image):
+        # This allows you to use the model as: results = model(image)
+        detections = self.infer(image)
+        if detections.size == 0:
+            # No detections found; return empty list
+            return []
+        # Build a simple container mimicking ultralytics output
+        xyxy = detections[:, :4]
+        cls = detections[:, 5].astype(int)
+        boxes = Boxes(xyxy=xyxy, cls=cls)
+        result = DetectionResult(boxes)
+        return [result]
 
 # ----------------------------------------------------------------------
 #                          MAIN VIDEO LOOP
@@ -266,7 +290,7 @@ class YoLOTRT:
 def main():
     logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s: %(message)s')
     
-    # Inputs/Outputs – update these paths as needed
+    # Update these paths as neededss
     video_path = r"test3plate.mp4"
     output_dir = r"ocr_output"
     os.makedirs(output_dir, exist_ok=True)
@@ -276,9 +300,9 @@ def main():
     os.makedirs(ocr_images_dir, exist_ok=True)
     os.makedirs(ocr_texts_dir, exist_ok=True)
     
-    # Load TensorRT YOLO engine and EasyOCR
-    model = YoLOTRT("best2.engine", input_shape=(3, 640, 640))
-    reader = easyocr.Reader(['en'], gpu=True)
+    # Load the TensorRT engine (best2.engine) and EasyOCR
+    model = YOLO("best2.engine", input_shape=(3, 640, 640))
+    reader = easyocr.Reader(['en'], gpu=True )
     pattern = re.compile(r'^(0[1-9]|[1-6]\d|70)$')
     
     cap = cv2.VideoCapture(video_path)
@@ -301,58 +325,62 @@ def main():
 
         masked_frame = apply_polygon_mask(frame)
         
-        # Run TensorRT YOLO inference on the masked frame
-        detections = model.infer(masked_frame)
-        for i, det in enumerate(detections):
-            x1, y1, x2, y2, conf, cls = det
-            if int(cls) == 1:  # Plate class
-                box_int = [int(x1), int(y1), int(x2), int(y2)]
-                # Safety check: ensure box center is within the polygon
-                cx = (box_int[0] + box_int[2]) // 2
-                cy = (box_int[1] + box_int[3]) // 2
-                if cv2.pointPolygonTest(POLYGON, (cx, cy), False) < 0:
-                    continue
-                
-                plate_crop = extract_plate(frame, box_int, margin=0.2)
-                if plate_crop is None:
-                    continue
-                if not quick_precheck(plate_crop, precheck_white_ratio=0.01):
-                    logging.info(f"Quick-skip frame {frame_count}_{i} due to low white pixel content.")
-                    continue
-                
-                final_processed = full_preprocess_pipeline(plate_crop)
-                base_angle = find_base_angle(final_processed)
-                angle_offsets = [-10, -5, 0, 5, 10]
-                best_texts = []
-                best_annotated = None
-                best_angle = None
+        # Run inference using the TensorRT engine via our YOLOTRT wrapper
+        results = model(masked_frame)
+        # results is a list (mimicking ultralytics), iterate through each detection result
+        for result in results:
+            # Mimic the ultralytics API: result.boxes.xyxy and result.boxes.cls
+            boxes = result.boxes.xyxy
+            class_ids = result.boxes.cls.tolist()
+            
+            for i, box in enumerate(boxes):
+                if class_ids[i] == 1:  # Plate class
+                    box_int = list(map(int, box))
+                    cx = (box_int[0] + box_int[2]) // 2
+                    cy = (box_int[1] + box_int[3]) // 2
+                    if cv2.pointPolygonTest(POLYGON, (cx, cy), False) < 0:
+                        continue
+                    
+                    plate_crop = extract_plate(frame, box_int, margin=0.2)
+                    if plate_crop is None:
+                        continue
+                    if not quick_precheck(plate_crop, precheck_white_ratio=0.01):
+                        logging.info(f"Quick-skip frame {frame_count}_{i} due to low white pixel content.")
+                        continue
+                    
+                    final_processed = full_preprocess_pipeline(plate_crop)
+                    base_angle = find_base_angle(final_processed)
+                    angle_offsets = [-10, -5, 0, 5, 10]
+                    best_texts = []
+                    best_annotated = None
+                    best_angle = None
 
-                for offset in angle_offsets:
-                    test_angle = base_angle + offset
-                    rotated = rotate_image(final_processed, test_angle)
-                    valid_texts, annotated = detect_two_digit_numbers(rotated, reader, pattern)
-                    if len(valid_texts) > len(best_texts):
-                        best_texts = valid_texts
-                        best_annotated = annotated
-                        best_angle = test_angle
-                    if len(best_texts) >= 2:
-                        break
-                
-                if best_annotated is not None and len(best_texts) > 0:
-                    ocr_image_name = f"ocr_frame{frame_count:06d}_plate{i}_angle{best_angle}.png"
-                    ocr_image_path = os.path.join(ocr_images_dir, ocr_image_name)
-                    cv2.imwrite(ocr_image_path, best_annotated)
+                    for offset in angle_offsets:
+                        test_angle = base_angle + offset
+                        rotated = rotate_image(final_processed, test_angle)
+                        valid_texts, annotated = detect_two_digit_numbers(rotated, reader, pattern)
+                        if len(valid_texts) > len(best_texts):
+                            best_texts = valid_texts
+                            best_annotated = annotated
+                            best_angle = test_angle
+                        if len(best_texts) >= 2:
+                            break
+                    
+                    if best_annotated is not None and len(best_texts) > 0:
+                        ocr_image_name = f"ocr_frame{frame_count:06d}_plate{i}_angle{best_angle}.png"
+                        ocr_image_path = os.path.join(ocr_images_dir, ocr_image_name)
+                        cv2.imwrite(ocr_image_path, best_annotated)
 
-                    ocr_text_name = f"ocr_frame{frame_count:06d}_plate{i}.txt"
-                    ocr_text_path = os.path.join(ocr_texts_dir, ocr_text_name)
-                    with open(ocr_text_path, "w", encoding="utf-8") as f:
-                        for t in best_texts:
-                            f.write(f"{t}\n")
+                        ocr_text_name = f"ocr_frame{frame_count:06d}_plate{i}.txt"
+                        ocr_text_path = os.path.join(ocr_texts_dir, ocr_text_name)
+                        with open(ocr_text_path, "w", encoding="utf-8") as f:
+                            for t in best_texts:
+                                f.write(f"{t}\n")
 
-                    logging.info(f"[OCR] Frame={frame_count}, Plate#{i}, Angle={best_angle}, Digits={best_texts}")
-                    saved_ocr_count += 1
-                else:
-                    logging.info(f"[NO DIGITS] Frame={frame_count}, Plate#{i}")
+                        logging.info(f"[OCR] Frame={frame_count}, Plate#{i}, Angle={best_angle}, Digits={best_texts}")
+                        saved_ocr_count += 1
+                    else:
+                        logging.info(f"[NO DIGITS] Frame={frame_count}, Plate#{i}")
 
         frame_count += 1
 
