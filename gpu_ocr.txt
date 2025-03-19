@@ -6,11 +6,10 @@ import re
 import easyocr
 from ultralytics import YOLO
 from skimage import exposure
-
+import sys
 
 MORPH_KERNEL = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
 
-# Global variable to store final plate number
 final_plate_number = None
 
 def order_points(pts):
@@ -206,120 +205,103 @@ def detect_two_digit_numbers(image, reader, pattern):
     return valid_texts, annotated_image
 
 
-# ----------------------------------------------------------------------
-#                          MAIN VIDEO LOOP
-# ----------------------------------------------------------------------
-
 def main():
     global final_plate_number
     logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s: %(message)s')
-    plate = []  # List to track detected numbers
-    
-    # Inputs/Outputs
+    plate = []
+
     video_path = r"test3plate.mp4"
-    
+
     model = YOLO("best2.engine")
-    reader = easyocr.Reader(['en'], gpu=True)
+    reader = easyocr.Reader(['en'], gpu=False, verbose=False)
     pattern = re.compile(r'^(0[1-9]|[1-6]\d|70)$')
     
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
         logging.error("Unable to open video file.")
-        return
+        sys.exit(1)
 
     frame_count = 0
     frame_skip = 15
 
-    while True:
-        # Check if we've already found a plate number with high confidence
-        if final_plate_number is not None:
-            logging.info(f"Plate number {final_plate_number} detected with high confidence. Stopping processing.")
-            break
-            
-        ret, frame = cap.read()
-        if not ret:
-            break
-        
-        # Optionally skip frames for speed
-        if frame_count % frame_skip != 0:
+    try:
+        while True:
+            if final_plate_number is not None:
+                logging.info(f"Plate number {final_plate_number} detected with high confidence. Stopping processing.")
+                break
+
+            ret, frame = cap.read()
+            if not ret:
+                logging.info("End of video reached.")
+                break
+
+            if frame_count % frame_skip != 0:
+                frame_count += 1
+                continue
+
+            masked_frame = apply_polygon_mask(frame)
+            results = model(masked_frame)
+            for result in results:
+                boxes = result.boxes.xyxy
+                class_ids = result.boxes.cls.int().tolist()
+
+                for i, box in enumerate(boxes):
+                    if class_ids[i] == 1:
+                        box_int = list(map(int, box))
+                        cx = (box_int[0] + box_int[2]) // 2
+                        cy = (box_int[1] + box_int[3]) // 2
+                        if cv2.pointPolygonTest(POLYGON, (cx, cy), False) < 0:
+                            continue
+
+                        plate_crop = extract_plate(frame, box_int, margin=0.2)
+                        if plate_crop is None:
+                            continue
+                        if not quick_precheck(plate_crop, precheck_white_ratio=0.01):
+                            logging.info(f"Quick-skip frame {frame_count}_{i} due to low white pixel content.")
+                            continue
+
+                        final_processed = full_preprocess_pipeline(plate_crop)
+
+                        base_angle = find_base_angle(final_processed)
+                        angle_offsets = [-10, -5, 0, 5, 10]
+                        best_texts = []
+                        best_angle = None
+
+                        for offset in angle_offsets:
+                            test_angle = base_angle + offset
+                            rotated = rotate_image(final_processed, test_angle)
+                            valid_texts, _ = detect_two_digit_numbers(rotated, reader, pattern)
+
+                            if len(valid_texts) > len(best_texts):
+                                best_texts = valid_texts
+                                best_angle = test_angle
+
+                            if len(best_texts) >= 2:
+                                break
+
+                        if len(best_texts) > 0:
+                            for text in best_texts:
+                                plate.append(text)
+                            frequent_result = find_frequent_element(plate)
+
+                            if frequent_result != 0:
+                                final_plate_number = frequent_result
+                                logging.info(f"PLATE NUMBER DETECTED: {final_plate_number}")
+                                break
+
+                            logging.info(f"[OCR] Frame={frame_count}, Detected={best_texts}, Current list={plate}")
+                        else:
+                            logging.info(f"[NO DIGITS] Frame={frame_count}")
             frame_count += 1
-            continue
-
-        # 1) Mask the frame so YOLO only sees your polygon region
-        masked_frame = apply_polygon_mask(frame)
-        
-        # 2) Run YOLO detection on masked frame
-        results = model(masked_frame)
-        for result in results:
-            boxes = result.boxes.xyxy
-            class_ids = result.boxes.cls.int().tolist()
-
-            for i, box in enumerate(boxes):
-                if class_ids[i] == 1:  # Plate class
-                    box_int = list(map(int, box))
-                    
-                    # Safety check: ensure center of box is inside polygon
-                    cx = (box_int[0] + box_int[2]) // 2
-                    cy = (box_int[1] + box_int[3]) // 2
-                    if cv2.pointPolygonTest(POLYGON, (cx, cy), False) < 0:
-                        continue
-                    
-                    # 3) Extract & pre-check
-                    plate_crop = extract_plate(frame, box_int, margin=0.2)
-                    if plate_crop is None:
-                        continue
-                    if not quick_precheck(plate_crop, precheck_white_ratio=0.01):
-                        logging.info(f"Quick-skip frame {frame_count}_{i} due to low white pixel content.")
-                        continue
-                    
-                    # 4) Full preprocessing
-                    final_processed = full_preprocess_pipeline(plate_crop)
-
-                    # 5) Now run EasyOCR multi-angle approach
-                    base_angle = find_base_angle(final_processed)
-                    angle_offsets = [-10, -5, 0, 5, 10]
-                    best_texts = []
-                    best_annotated = None
-                    best_angle = None
-
-                    for offset in angle_offsets:
-                        test_angle = base_angle + offset
-                        rotated = rotate_image(final_processed, test_angle)
-                        valid_texts, annotated = detect_two_digit_numbers(rotated, reader, pattern)
-
-                        if len(valid_texts) > len(best_texts):
-                            best_texts = valid_texts
-                            best_annotated = annotated
-                            best_angle = test_angle
-
-                        # Early stopping if you want
-                        if len(best_texts) >= 2:
-                            break
-                    
-                    # 6) If we found any valid digits, update our tracking
-                    if best_annotated is not None and len(best_texts) > 0:
-                        # Add recognized digits to our plate list
-                        for text in best_texts:
-                            plate.append(text)
-                        
-                        # Check if we have a frequent element (3+ occurrences)
-                        frequent_result = find_frequent_element(plate)
-                        
-                        if frequent_result != 0:
-                            # We found our plate number! Store it and prepare to stop
-                            final_plate_number = frequent_result
-                            logging.info(f"PLATE NUMBER DETECTED: {final_plate_number}")
-                            break
-                        
-                        logging.info(f"[OCR] Frame={frame_count}, Detected={best_texts}, Current list={plate}")
-                    else:
-                        logging.info(f"[NO DIGITS] Frame={frame_count}")
-
-        frame_count += 1
-
-    cap.release()
-    logging.info(f"Final plate number: {final_plate_number}")
-    return final_plate_number
+    except KeyboardInterrupt:
+        logging.warning("Process interrupted by user (Ctrl+C).")
+    except Exception as e:
+        logging.exception(f"Unhandled exception occurred: {e}")
+    finally:
+        cap.release()
+        logging.info("Video capture released.")
+        logging.info(f"Final plate number result: {final_plate_number}")
+        sys.exit(0 if final_plate_number else 1)
 
 if __name__ == "__main__":
     main()
