@@ -201,8 +201,8 @@ def main():
     logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s: %(message)s')
     
     # Inputs/Outputs
-    video_path = r"C:\Users\Kartikey.Tiwari\Downloads\ForkLfit\New folder\test3plate.mp4"
-    output_dir = r"C:\Users\Kartikey.Tiwari\Downloads\ForkLfit\New folder\ocr_output"
+    video_path = r"test3plate.mp4"
+    output_dir = r"ocr_output"
     os.makedirs(output_dir, exist_ok=True)
     
     # Subfolders for OCR results
