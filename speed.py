@@ -90,7 +90,7 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument(
         "source_video_path",
         nargs="?",
-        default=r"test3plate.mp4",
+        default=r"C:\Users\Kartikey.Tiwari\Downloads\ForkLfit\New folder\test3plate.mp4",
         help="Path to the source video file",
         type=str,
     )
@@ -123,19 +123,28 @@ def parse_arguments() -> argparse.Namespace:
 
 def main():
     args = parse_arguments()
-    video_info = sv.VideoInfo.from_video_path(args.source_video_path)
+    
+    # Initialize video capture
+    cap = cv2.VideoCapture(args.source_video_path)
+    fps = int(cap.get(cv2.CAP_PROP_FPS))
+    frame_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    frame_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     
     # Initialize components
     model = YOLO("best2.pt")
     byte_track = sv.ByteTrack(
-        frame_rate=video_info.fps, 
+        frame_rate=fps, 
         track_activation_threshold=args.confidence_threshold
     )
     speed_estimator = SpeedEstimator(args.target_fps)
     
+    # Setup video writer
+    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+    out = cv2.VideoWriter(args.target_video_path, fourcc, args.target_fps, (frame_width, frame_height))
+    
     # Setup visualization
-    thickness = sv.calculate_optimal_line_thickness(video_info.resolution_wh)
-    text_scale = sv.calculate_optimal_text_scale(video_info.resolution_wh)
+    thickness = sv.calculate_optimal_line_thickness((frame_width, frame_height))
+    text_scale = sv.calculate_optimal_text_scale((frame_width, frame_height))
     box_annotator = sv.BoxAnnotator(thickness=thickness)
     label_annotator = sv.LabelAnnotator(
         text_scale=text_scale,
@@ -144,7 +153,7 @@ def main():
     )
     trace_annotator = sv.TraceAnnotator(
         thickness=thickness,
-        trace_length=video_info.fps * 3,
+        trace_length=fps * 3,
         position=sv.Position.BOTTOM_CENTER,
     )
 
@@ -155,57 +164,60 @@ def main():
     view_transformer = ViewTransformer(source=SOURCE, target=TARGET)
 
     # Process frames
-    frame_generator = sv.get_video_frames_generator(args.source_video_path)
-    skip_frames = max(int(video_info.fps / args.target_fps), 1)
+    skip_frames = max(int(fps / args.target_fps), 1)
     frame_counter = 0
 
-    with sv.VideoSink(args.target_video_path, video_info) as sink:
-        for frame in frame_generator:
-            frame_counter += 1
-            if frame_counter % skip_frames != 0:
-                sink.write_frame(frame)
-                continue
+    while cap.isOpened():
+        ret, frame = cap.read()
+        if not ret:
+            break
 
-            # Detect and track forklifts
-            result = model(frame)[0]
-            detections = sv.Detections.from_ultralytics(result)
-            detections = detections[detections.confidence > args.confidence_threshold]
-            detections = detections[detections.class_id == 0]  # Only forklift class
-            
-            if not args.debug:
-                detections = detections[polygon_zone.trigger(detections)]
-            
-            detections = detections.with_nms(threshold=args.iou_threshold)
-            detections = byte_track.update_with_detections(detections=detections)
+        frame_counter += 1
+        if frame_counter % skip_frames != 0:
+            continue
 
-            # Calculate speeds
-            points = detections.get_anchors_coordinates(anchor=sv.Position.BOTTOM_CENTER)
-            transformed_points = view_transformer.transform_points(points=points)
-            
-            labels = []
-            for i, (tracker_id, point) in enumerate(zip(detections.tracker_id, transformed_points)):
-                speed = speed_estimator.calculate_speed(tracker_id, point)
-                label = f"Forklift #{tracker_id}"
-                if speed is not None:
-                    label += f" Speed: {speed:.1f} mph"
-                labels.append(label)
+        # Detect and track forklifts
+        result = model(frame)[0]
+        detections = sv.Detections.from_ultralytics(result)
+        detections = detections[detections.confidence > args.confidence_threshold]
+        detections = detections[detections.class_id == 0]  # Only forklift class
+        
+        if not args.debug:
+            detections = detections[polygon_zone.trigger(detections)]
+        
+        detections = detections.with_nms(threshold=args.iou_threshold)
+        detections = byte_track.update_with_detections(detections=detections)
 
-            # Annotate frame
-            annotated_frame = frame.copy()
-            annotated_frame = trace_annotator.annotate(scene=annotated_frame, detections=detections)
-            annotated_frame = box_annotator.annotate(scene=annotated_frame, detections=detections)
-            annotated_frame = label_annotator.annotate(scene=annotated_frame, detections=detections, labels=labels)
+        # Calculate speeds
+        points = detections.get_anchors_coordinates(anchor=sv.Position.BOTTOM_CENTER)
+        transformed_points = view_transformer.transform_points(points=points)
+        
+        labels = []
+        for i, (tracker_id, point) in enumerate(zip(detections.tracker_id, transformed_points)):
+            speed = speed_estimator.calculate_speed(tracker_id, point)
+            label = f"Forklift #{tracker_id}"
+            if speed is not None:
+                label += f" Speed: {speed:.1f} mph"
+            labels.append(label)
 
-            if args.debug:
-                # Draw debug information
-                pts = SOURCE.astype(np.int32).reshape((-1, 1, 2))
-                cv2.polylines(annotated_frame, [pts], True, (0, 255, 0), 2)
+        # Annotate frame
+        annotated_frame = frame.copy()
+        annotated_frame = trace_annotator.annotate(scene=annotated_frame, detections=detections)
+        annotated_frame = box_annotator.annotate(scene=annotated_frame, detections=detections)
+        annotated_frame = label_annotator.annotate(scene=annotated_frame, detections=detections, labels=labels)
 
-            sink.write_frame(annotated_frame)
-            cv2.imshow("frame", annotated_frame)
-            if cv2.waitKey(1) & 0xFF == ord("q"):
-                break
+        if args.debug:
+            # Draw debug information
+            pts = SOURCE.astype(np.int32).reshape((-1, 1, 2))
+            cv2.polylines(annotated_frame, [pts], True, (0, 255, 0), 2)
 
+        out.write(annotated_frame)
+        cv2.imshow("frame", annotated_frame)
+        if cv2.waitKey(1) & 0xFF == ord("q"):
+            break
+
+    cap.release()
+    out.release()
     cv2.destroyAllWindows()
 
 if __name__ == "__main__":
