@@ -623,6 +623,8 @@ def _do_ocr_for_plate(frame, plate_box, forklift_tracker, nearest_forklift_id, r
 
 
 def main():
+    
+
     global VIOLATION_SPEED, VIOLATION_FRAMES
 
     args = parse_arguments()
@@ -633,24 +635,58 @@ def main():
     VIOLATION_FRAMES = args.violation_frames
     print(f"VIOLATION_SPEED={VIOLATION_SPEED}, VIOLATION_FRAMES={VIOLATION_FRAMES}")
 
-    # If you want to do RTSP input (instead of file), handle that logic:
-    if args.rtsp_url.strip():
-        print(f"Using RTSP URL: {args.rtsp_url}")
-        # For example, you could set args.source_video_path = <some GStreamer pipeline> 
-        # or skip using 'source_video_path' entirely and handle it directly.
-        # This is left up to you to incorporate.
+    # ------------------- NEW GSTREAMER + FALLBACK LOGIC -------------------
+    # If user gave an RTSP URL, build GStreamer pipeline
+    if args.rtsp_url.strip() != "":
+        gst_pipeline = (
+            f"rtspsrc location={args.rtsp_url} latency=200 ! "
+            "rtph264depay ! h264parse ! nvv4l2decoder ! nvvidconv ! "
+            "video/x-raw, format=BGRx ! videoconvert ! video/x-raw, format=BGR ! "
+            "appsink drop=1"
+        )
+        print(f"RTSP URL: {args.rtsp_url}")
+
+        cap = cv2.VideoCapture(gst_pipeline, cv2.CAP_GSTREAMER)
+        if not cap.isOpened():
+            # Fallback if RTSP can't be opened
+            print("Warning: Unable to open RTSP stream. Falling back to local 'test3plate.mp4'")
+            cap = cv2.VideoCapture("test3plate.mp4")
+            video_info = sv.VideoInfo.from_video_path("test3plate.mp4")
+        else:
+            # If RTSP opened OK, create video_info from the capture object
+            video_info = sv.VideoInfo.from_video_capture(cap)
+    else:
+        print("No RTSP URL provided. Using local file: test3plate.mp4")
+        cap = cv2.VideoCapture("test3plate.mp4")
+        video_info = sv.VideoInfo.from_video_path("test3plate.mp4")
+
+    if not cap.isOpened():
+        print("Error: Unable to open any stream or file.")
+        sys.exit(1)
+    # --------------- END GSTREAMER + FALLBACK LOGIC ---------------
+
+    # If you want to do GPU-based CV2 operations, you can set up a GpuMat:
+    frame_gpu = cv2.cuda_GpuMat()
 
     # For storing the stop sign bounding box once we fix it
     fixed_stop_sign = None  # [x1, y1, x2, y2]
 
-    video_info = sv.VideoInfo.from_video_path(args.source_video_path)
-    model = YOLO("best2.pt")  # adjust if needed
+    # ---------------------------------------------------------
+    # DO NOT RE-INITIALIZE cap/video_info from args here!
+    # Remove or comment out your old lines like:
+    #     video_info = sv.VideoInfo.from_video_path(args.source_video_path)
+    #     cap = cv2.VideoCapture(args.source_video_path)
+    # Because it would undo our new logic.
+    # ---------------------------------------------------------
+
+    # Set up your model (TensorRT engine, for instance)
+    model = YOLO("best2.engine")  # or "best.engine"
 
     # ByteTrack for forklift
     byte_track = sv.ByteTrack(frame_rate=video_info.fps,
                               track_activation_threshold=args.confidence_threshold)
 
-    # Visualization
+    # Visualization setup
     thickness = sv.calculate_optimal_line_thickness(video_info.resolution_wh)
     text_scale = sv.calculate_optimal_text_scale(video_info.resolution_wh)
     box_annotator = sv.BoxAnnotator(thickness=thickness)
@@ -667,7 +703,7 @@ def main():
     view_transformer = ViewTransformer(source=SOURCE, target=TARGET)
 
     # OCR
-    reader = easyocr.Reader(['en'], gpu=False, verbose=False)
+    reader = easyocr.Reader(['en'], gpu=True, verbose=False)
     ocr_pattern = re.compile(r'^(0[1-9]|[1-6]\d|70)$')
 
     # Forklift + speed
@@ -694,7 +730,7 @@ def main():
     skip_frames = max(int(video_info.fps / args.target_fps), 1) if video_info.fps > 0 else 1
     logging.info(f"Original FPS={video_info.fps}, target_fps={args.target_fps}, skip_frames={skip_frames}")
 
-    cap = cv2.VideoCapture(args.source_video_path)
+    # We already have 'cap' from the GStreamer or fallback file
     frame_index = 0
 
     with sv.VideoSink(args.target_video_path, video_info) as sink:
@@ -715,12 +751,18 @@ def main():
             detections = sv.Detections.from_ultralytics(results)
 
             # Separate classes
-            forklift_dets = detections[(detections.class_id == FORKLIFT_CLASS) &
-                                       (detections.confidence > args.confidence_threshold)]
-            plate_dets = detections[(detections.class_id == PLATE_CLASS) &
-                                    (detections.confidence > args.confidence_threshold)]
-            stop_dets = detections[(detections.class_id == STOP_SIGN_CLASS) &
-                                   (detections.confidence > args.confidence_threshold)]
+            forklift_dets = detections[
+                (detections.class_id == FORKLIFT_CLASS) &
+                (detections.confidence > args.confidence_threshold)
+            ]
+            plate_dets = detections[
+                (detections.class_id == PLATE_CLASS) &
+                (detections.confidence > args.confidence_threshold)
+            ]
+            stop_dets = detections[
+                (detections.class_id == STOP_SIGN_CLASS) &
+                (detections.confidence > args.confidence_threshold)
+            ]
 
             # Fix the stop sign if we haven't done so yet
             if fixed_stop_sign is None and len(stop_dets) > 0:
@@ -789,7 +831,6 @@ def main():
                 # Wait for all OCR tasks
                 for future in as_completed(plate_tasks):
                     result = future.result()
-                    # result is either (forklift_id, best_texts) or None
                     if result is None:
                         continue
                     assigned_forklift_id, best_texts = result
@@ -816,7 +857,6 @@ def main():
                 else:
                     lbl = f"Forklift #{f_id} Plate:{plate_str} Speed:{speed_mph:.1f} mph"
 
-                # Violation check (uses the now-updated global constants)
                 if speed_mph >= VIOLATION_SPEED:
                     consecutive_speed_count[f_id] += 1
                 else:
