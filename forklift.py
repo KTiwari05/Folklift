@@ -651,35 +651,29 @@ def main():
             # Fallback if RTSP can't be opened
             print("Warning: Unable to open RTSP stream. Falling back to local 'test3plate.mp4'")
             cap = cv2.VideoCapture("test3plate.mp4")
-            video_info = sv.VideoInfo.from_video_path("test3plate.mp4")
-        else:
-            # If RTSP opened OK, create video_info from the capture object
-            video_info = sv.VideoInfo.from_video_capture(cap)
+        # ...removed: video_info = sv.VideoInfo.from_video_path("test3plate.mp4")
     else:
         print("No RTSP URL provided. Using local file: test3plate.mp4")
         cap = cv2.VideoCapture("test3plate.mp4")
-        video_info = sv.VideoInfo.from_video_path("test3plate.mp4")
+        # ...removed: video_info = sv.VideoInfo.from_video_path("test3plate.mp4")
 
     if not cap.isOpened():
         print("Error: Unable to open any stream or file.")
         sys.exit(1)
-    # --------------- END GSTREAMER + FALLBACK LOGIC ---------------
 
-    # If you want to do GPU-based CV2 operations, you can set up a GpuMat:
+    # Create video_info from VideoCapture properties instead of using sv.VideoInfo
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    frame_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    frame_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    from collections import namedtuple
+    VideoInfo = namedtuple("VideoInfo", ["fps", "resolution_wh"])
+    video_info = VideoInfo(fps, (frame_width, frame_height))
+
     frame_gpu = cv2.cuda_GpuMat()
 
     # For storing the stop sign bounding box once we fix it
     fixed_stop_sign = None  # [x1, y1, x2, y2]
 
-    # ---------------------------------------------------------
-    # DO NOT RE-INITIALIZE cap/video_info from args here!
-    # Remove or comment out your old lines like:
-    #     video_info = sv.VideoInfo.from_video_path(args.source_video_path)
-    #     cap = cv2.VideoCapture(args.source_video_path)
-    # Because it would undo our new logic.
-    # ---------------------------------------------------------
-
-    # Set up your model (TensorRT engine, for instance)
     model = YOLO("best2.engine")  # or "best.engine"
 
     # ByteTrack for forklift
