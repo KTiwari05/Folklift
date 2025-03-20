@@ -90,7 +90,7 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument(
         "source_video_path",
         nargs="?",
-        default=r"C:\Users\Kartikey.Tiwari\Downloads\ForkLfit\New folder\test3plate.mp4",
+        default=r"test3plate.mp4",
         help="Path to the source video file",
         type=str,
     )
