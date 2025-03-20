@@ -1,0 +1,6 @@
+--rtsp_url="rtsp://admin:Motherson12@10.228.161.21:554/main"
+--send_email="Charu.Jain@motherson.com"
+--password="Amity@8078"
+--recipient="aktiwariqq@gmail.com"
+--violation_speed=5.0
+--violation_frames=5
