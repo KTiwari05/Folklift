@@ -9,6 +9,7 @@ import easyocr
 from skimage import exposure
 import supervision as sv
 from ultralytics import YOLO
+import time  # added for inference time measurement
 
 # -------------------------------------------------------------------
 #                        Kalman + Utilities
@@ -94,45 +95,29 @@ class SpeedEstimator:
         if pts.shape[0] < 2:
             return self.last_speeds[tracker_id]
 
-        recent_speeds = []
-
-        # 1. Regression-Based Speed Calculation
+        # Use a weighted average approach for speed:
         if pts.shape[0] >= self.window_size:
             t = np.arange(self.window_size)  # time indices for the window
             window_pts = pts[-self.window_size:]
-            # Linear regression on x and y coordinates (slope in pixels per frame)
+            # Compute regression speed on x and y coordinates
             slope_x, _ = np.polyfit(t, window_pts[:, 0], 1)
             slope_y, _ = np.polyfit(t, window_pts[:, 1], 1)
             reg_speed_pixels = np.sqrt(slope_x**2 + slope_y**2) * self.fps  # pixels/second
-            if not use_real_world:
-                reg_speed_mps = reg_speed_pixels * self.pixel_to_meter
-            else:
-                reg_speed_mps = reg_speed_pixels
-            recent_speeds.append(reg_speed_mps)
+            reg_speed_mps = reg_speed_pixels if use_real_world else reg_speed_pixels * self.pixel_to_meter
+
+            # Compute instantaneous speed using the endpoints of the window
+            displacement_pixels = np.linalg.norm(pts[-1] - pts[-self.window_size])
+            dt = (self.window_size - 1) / self.fps
+            inst_speed_pixels = displacement_pixels / dt
+            inst_speed_mps = inst_speed_pixels if use_real_world else inst_speed_pixels * self.pixel_to_meter
+
+            # Weighted combination (0.4 regression, 0.6 instantaneous)
+            measured_speed_mps = 0.4 * reg_speed_mps + 0.6 * inst_speed_mps
         else:
             # Fallback: use difference between last two points.
             displacement_pixels = np.linalg.norm(pts[-1] - pts[-2])
             inst_speed_pixels = displacement_pixels * self.fps
-            if not use_real_world:
-                inst_speed_mps = inst_speed_pixels * self.pixel_to_meter
-            else:
-                inst_speed_mps = inst_speed_pixels
-            recent_speeds.append(inst_speed_mps)
-
-        # 2. Windowed Instantaneous Speed Calculation
-        if pts.shape[0] >= self.window_size:
-            # Use the first point of the window and the latest point
-            displacement_pixels = np.linalg.norm(pts[-1] - pts[-self.window_size])
-            # Time difference = (window_size - 1) frames; dt in seconds = (window_size - 1) / fps
-            dt = (self.window_size - 1) / self.fps
-            inst_speed_pixels = displacement_pixels / dt  # pixels/second
-            if not use_real_world:
-                inst_speed_mps = inst_speed_pixels * self.pixel_to_meter
-            else:
-                inst_speed_mps = inst_speed_pixels
-            recent_speeds.append(inst_speed_mps)
-
-        measured_speed_mps = np.mean(recent_speeds)
+            measured_speed_mps = inst_speed_pixels if use_real_world else inst_speed_pixels * self.pixel_to_meter
 
         # Apply Kalman filtering for smoothing
         if tracker_id not in self.speed_filters:
@@ -381,7 +366,7 @@ class ForkliftTracker:
 def parse_arguments():
     parser = argparse.ArgumentParser(description="Forklift Speed + OCR with optimized tracking and speed estimation.")
     parser.add_argument("source_video_path", nargs="?", default=r"test3plate.mp4", help="Path to the source video file", type=str)
-    parser.add_argument("target_video_path", nargs="?", default=r"test_output1.mp4", help="Path to the target video file (output)", type=str)
+    parser.add_argument("target_video_path", nargs="?", default=r"C:\Users\Kartikey.Tiwari\Downloads\ForkLfit\test_output1.mp4", help="Path to the target video file (output)", type=str)
     parser.add_argument("--confidence_threshold", default=0.3, type=float, help="Confidence threshold for YOLO")
     parser.add_argument("--iou_threshold", default=0.7, type=float, help="IOU threshold for NMS")
     parser.add_argument("--target_fps", default=6.0, type=float, help="Target processing FPS (skip frames)")
@@ -411,9 +396,20 @@ def main():
     label_annotator = sv.LabelAnnotator(text_scale=text_scale, text_thickness=thickness, text_position=sv.Position.BOTTOM_CENTER)
     trace_annotator = sv.TraceAnnotator(thickness=thickness, trace_length=int(video_info.fps) * 3, position=sv.Position.BOTTOM_CENTER)
 
-    # Forklift detection zone
+    # Forklift detection zone and expanded polygon by 50 pixels extra horizontally:
     SOURCE = np.array([[568, 310], [1321, 330], [1600, 1002], [264, 976]])
-    polygon_zone = sv.PolygonZone(polygon=SOURCE)
+    min_x = np.min(SOURCE[:, 0])
+    max_x = np.max(SOURCE[:, 0])
+    mid_x = (min_x + max_x) / 2
+    expanded_SOURCE = SOURCE.copy()
+    for i in range(len(expanded_SOURCE)):
+        if expanded_SOURCE[i, 0] < mid_x:
+            # Previously shifted 50, now subtract a total of 100 pixels
+            expanded_SOURCE[i, 0] -= 100
+        else:
+            # Previously added 50, now add 100 pixels
+            expanded_SOURCE[i, 0] += 100
+    polygon_zone = sv.PolygonZone(polygon=expanded_SOURCE)
 
     # Real-world transform
     TARGET = np.array([[0, 0], [12.192, 0], [12.192, 12.192], [0, 12.192]])
@@ -447,57 +443,70 @@ def main():
                 sink.write_frame(frame)
                 continue
 
-            results = model(frame, verbose=False)[0]
-            detections = sv.Detections.from_ultralytics(results)
+            # Get frame dimensions
+            height, width = frame.shape[:2]
 
+            # Measure preprocess time (if any pre-processing is done; here it is a dummy op)
+            pre_start = time.time()
+            # ...no additional preprocessing...
+            pre_time = (time.time() - pre_start) * 1000
+
+            # Measure inference time
+            inf_start = time.time()
+            results = model(frame, verbose=False)[0]
+            inf_time = (time.time() - inf_start) * 1000
+
+            # Measure postprocess time for detection filtering, tracking etc.
+            post_start = time.time()
+            detections = sv.Detections.from_ultralytics(results)
             forklifts = detections[(detections.class_id == 0) & (detections.confidence > args.confidence_threshold)]
             plates = detections[(detections.class_id == 1) & (detections.confidence > args.confidence_threshold)]
 
             if not args.debug:
                 forklifts = forklifts[polygon_zone.trigger(forklifts)]
             forklifts = forklifts.with_nms(threshold=args.iou_threshold)
-            
+
             forklifts = byte_track.update_with_detections(detections=forklifts)
             forklift_centers = forklifts.get_anchors_coordinates(anchor=sv.Position.BOTTOM_CENTER)
             forklift_ids = forklifts.tracker_id
-            
+
             real_world_centers = view_transformer.transform_points(forklift_centers)
 
             for i, f_id in enumerate(forklift_ids):
                 forklift_tracker.register_forklift(f_id, forklift_centers[i])
                 if i < len(forklift_centers) and i < len(real_world_centers):
-                    speed_estimator.add_position(f_id, forklift_centers[i], real_world_centers[i] if len(real_world_centers) > 0 else None)
+                    speed_estimator.add_position(f_id, forklift_centers[i],
+                        real_world_centers[i] if len(real_world_centers) > 0 else None)
 
             for j, plate_box in enumerate(plates.xyxy):
                 px = (plate_box[0] + plate_box[2]) / 2
                 py = (plate_box[1] + plate_box[3]) / 2
-                
+
                 if (not is_point_in_polygon(px, py, PLATE_POLYGON) or 
                     forklift_tracker.is_plate_processed(plate_box) or 
                     forklift_tracker.is_plate_near_previous_detection(plate_box)):
                     continue
-                
+
                 forklift_tracker.mark_plate_processed(plate_box)
-                
+
                 if len(forklift_centers) > 0:
                     plate_center = np.array([px, py])
                     distances = [np.linalg.norm(plate_center - fc) for fc in forklift_centers]
                     nearest_idx = np.argmin(distances)
                     nearest_forklift_id = forklift_ids[nearest_idx]
-                    
+
                     if forklift_tracker.forklift_data.get(nearest_forklift_id, {}).get('confirmed_plate', False):
                         continue
-                    
+
                     plate_crop = extract_plate(frame, plate_box)
                     if plate_crop is None or not quick_precheck(plate_crop, precheck_white_ratio=0.01):
                         continue
-                    
+
                     processed_plate = full_preprocess_pipeline(plate_crop)
-                    
                     base_angle = find_base_angle(processed_plate)
                     angle_offsets = [-10, -5, 0, 5, 10]
                     best_texts = []
-                    
+
                     for offset in angle_offsets:
                         test_angle = base_angle + offset
                         rotated_img = rotate_image(processed_plate, test_angle)
@@ -506,12 +515,12 @@ def main():
                             best_texts = valid_texts
                         if len(best_texts) >= 2:
                             break
-                    
+
                     for text in best_texts:
                         forklift_tracker.add_raw_text_to_forklift(nearest_forklift_id, text)
-                    
+
                     forklift_tracker.update_plate_detection_history(nearest_forklift_id, plate_center)
-                    
+
                     raw_texts = forklift_tracker.get_raw_texts_for_forklift(nearest_forklift_id)
                     if raw_texts:
                         freq_result = find_frequent_element(raw_texts)
@@ -530,20 +539,29 @@ def main():
                     lbl = f"Forklift #{f_id} Speed:{speed_mph:.1f} mph"
                 labels.append(lbl)
 
+            post_time = (time.time() - post_start) * 1000
+            # ...existing annotation code...
             annotated_frame = frame.copy()
             annotated_frame = trace_annotator.annotate(scene=annotated_frame, detections=forklifts)
             annotated_frame = box_annotator.annotate(scene=annotated_frame, detections=forklifts)
             annotated_frame = label_annotator.annotate(scene=annotated_frame, detections=forklifts, labels=labels)
 
-            if args.debug:
-                pts = SOURCE.astype(np.int32).reshape((-1, 1, 2))
-                cv2.polylines(annotated_frame, [pts], True, (0, 255, 0), 2)
-                pts_plate = PLATE_POLYGON.astype(np.int32).reshape((-1, 1, 2))
-                cv2.polylines(annotated_frame, [pts_plate], True, (0, 0, 255), 2)
-
+            # Compose overlay text as specified (but print to terminal instead of overlaying on frame)
+            forklift_count = len(forklift_ids)
+            plate_count = len(plates.xyxy)
+            stop_count = 1  # (Using a dummy value)
+            overlay_text_line1 = f"{frame_index}: {height}x{width} {forklift_count} forklift{'s' if forklift_count != 1 else ''}, {plate_count} plate{'s' if plate_count != 1 else ''}, {stop_count} stop, {inf_time:.1f}ms"
+            overlay_text_line2 = f"Speed: {pre_time:.1f}ms preprocess, {inf_time:.1f}ms inference, {post_time:.1f}ms postprocess per image at shape (1, 3, {height}, {width})"
+            
+            # Print performance info to terminal instead of overlaying on the frame
+            print(overlay_text_line1)
+            print(overlay_text_line2)
+            
+            # Remove cv2.putText overlay calls from the frame (i.e. do not add texts to annotated_frame)
+            # ...existing annotation code remains...
             sink.write_frame(annotated_frame)
             cv2.imshow("Forklift Tracking", annotated_frame)
-            
+
             if cv2.waitKey(1) & 0xFF == ord("q"):
                 break
 
