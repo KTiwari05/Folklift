@@ -14,6 +14,17 @@ import time  # added for inference time measurement
 # -------------------------------------------------------------------
 #                        Kalman + Utilities
 # -------------------------------------------------------------------
+class ViewTransformer:
+    def __init__(self, source: np.ndarray, target: np.ndarray) -> None:
+        self.m = cv2.getPerspectiveTransform(source.astype(np.float32), target.astype(np.float32))
+
+    def transform_points(self, points: np.ndarray) -> np.ndarray:
+        if points.size == 0:
+            return points
+        reshaped_points = points.reshape(-1, 1, 2).astype(np.float32)
+        transformed_points = cv2.perspectiveTransform(reshaped_points, self.m)
+        return transformed_points.reshape(-1, 2)
+
 class SimpleKalmanFilter:
     def __init__(self, initial_estimate: float, process_variance: float = 0.1, measurement_variance: float = 1.0):
         self.estimate = initial_estimate
@@ -27,7 +38,6 @@ class SimpleKalmanFilter:
         self.estimate = self.estimate + K * (measurement - self.estimate)
         self.error_covariance = (1 - K) * self.error_covariance
         return self.estimate
-
 def convert_speed(speed_mps, unit='mph'):
     conversions = {'mph': 2.23694, 'kmh': 3.6, 'mps': 1.0}
     return speed_mps * conversions.get(unit, 1.0)
@@ -35,40 +45,22 @@ def convert_speed(speed_mps, unit='mph'):
 # -------------------------------------------------------------------
 #                    Perspective Transform
 # -------------------------------------------------------------------
-class ViewTransformer:
-    def __init__(self, source: np.ndarray, target: np.ndarray) -> None:
-        self.m = cv2.getPerspectiveTransform(source.astype(np.float32), target.astype(np.float32))
-
-    def transform_points(self, points: np.ndarray) -> np.ndarray:
-        if points.size == 0:
-            return points
-        reshaped_points = points.reshape(-1, 1, 2).astype(np.float32)
-        transformed_points = cv2.perspectiveTransform(reshaped_points, self.m)
-        return transformed_points.reshape(-1, 2)
 
 # -------------------------------------------------------------------
 #                    Speed Estimator
 # -------------------------------------------------------------------
 class SpeedEstimator:
-    def __init__(self, fps, window_size=5, pixel_to_meter=0.1):
-        """
-        fps: Frame rate (after skipping frames, if any).
-        window_size: Number of recent frames to use for regression and windowed difference.
-        pixel_to_meter: Conversion factor from pixels to meters (only used when real-world coords are unavailable).
-        """
+    def __init__(self, fps, window_size=5):
+        
         self.fps = fps
         self.window_size = window_size
-        self.pixel_to_meter = pixel_to_meter
         self.positions = defaultdict(lambda: deque(maxlen=int(fps * 3)))  # in pixel coordinates
         self.speed_filters = {}
         self.last_speeds = defaultdict(float)
         self.real_world_positions = defaultdict(lambda: deque(maxlen=int(fps * 3)))  # if available
 
     def add_position(self, tracker_id, point, real_world_point=None):
-        """
-        Add a new position (in pixels) for the tracker. If real-world point is provided, add that too.
-        Then estimate the speed.
-        """
+        
         self.positions[tracker_id].append(point)
         if real_world_point is not None:
             self.real_world_positions[tracker_id].append(real_world_point)
@@ -77,14 +69,8 @@ class SpeedEstimator:
         return 0.0
 
     def calculate_speed(self, tracker_id):
-        """
-        Estimate speed by combining two measurements:
-         1. A regression-based estimate using the last window_size positions.
-         2. A windowed instantaneous speed computed over a longer interval.
-        If real-world positions are available, they are used directly; otherwise, pixel displacements are converted.
-        The two estimates are averaged and then smoothed using a Kalman filter.
-        """
-        # Select coordinate system: use real-world positions if available.
+    
+        # Decide which position list (real-world or pixel) to use
         if tracker_id in self.real_world_positions and len(self.real_world_positions[tracker_id]) >= self.window_size:
             pts = np.array(self.real_world_positions[tracker_id])
             use_real_world = True
@@ -92,45 +78,52 @@ class SpeedEstimator:
             pts = np.array(self.positions[tracker_id])
             use_real_world = False
 
-        if pts.shape[0] < 2:
-            return self.last_speeds[tracker_id]
+        # If we have fewer than 'window_size' points, skip speed calculation
+        if pts.shape[0] < self.window_size:
+            # Either return the last known speed or return 0.0 to show "no data" yet
+            return self.last_speeds.get(tracker_id, 0.0)
 
-        # Use a weighted average approach for speed:
-        if pts.shape[0] >= self.window_size:
-            t = np.arange(self.window_size)  # time indices for the window
-            window_pts = pts[-self.window_size:]
-            # Compute regression speed on x and y coordinates
-            slope_x, _ = np.polyfit(t, window_pts[:, 0], 1)
-            slope_y, _ = np.polyfit(t, window_pts[:, 1], 1)
-            reg_speed_pixels = np.sqrt(slope_x**2 + slope_y**2) * self.fps  # pixels/second
-            reg_speed_mps = reg_speed_pixels if use_real_world else reg_speed_pixels * self.pixel_to_meter
+        # Now that we have enough points, proceed with your calculations
+        recent_speeds = []
 
-            # Compute instantaneous speed using the endpoints of the window
-            displacement_pixels = np.linalg.norm(pts[-1] - pts[-self.window_size])
-            dt = (self.window_size - 1) / self.fps
-            inst_speed_pixels = displacement_pixels / dt
-            inst_speed_mps = inst_speed_pixels if use_real_world else inst_speed_pixels * self.pixel_to_meter
+        # 1. Regression-based speed calculation (across the last window_size frames)
+        t = np.arange(self.window_size)  # indices 0 .. (window_size-1)
+        window_pts = pts[-self.window_size:]
+        slope_x, _ = np.polyfit(t, window_pts[:, 0], 1)
+        slope_y, _ = np.polyfit(t, window_pts[:, 1], 1)
+        reg_speed_pixels = np.sqrt(slope_x**2 + slope_y**2) * self.fps  # in pixels/second
+        reg_speed_mps = reg_speed_pixels  # (no pixel->meter unless you incorporate that externally)
+        recent_speeds.append(reg_speed_mps)
 
-            # Weighted combination (0.4 regression, 0.6 instantaneous)
-            measured_speed_mps = 0.4 * reg_speed_mps + 0.6 * inst_speed_mps
+        # 2. Windowed instantaneous speed calculation
+        displacement_pixels = np.linalg.norm(pts[-1] - pts[-self.window_size])
+        dt = (self.window_size - 1) / self.fps  # time interval for the window
+        inst_speed_pixels = displacement_pixels / dt
+        if not use_real_world:
+            # In case you have a pixel-to-meter factor; otherwise keep as-is
+            inst_speed_mps = inst_speed_pixels  # or inst_speed_pixels * self.pixel_to_meter
         else:
-            # Fallback: use difference between last two points.
-            displacement_pixels = np.linalg.norm(pts[-1] - pts[-2])
-            inst_speed_pixels = displacement_pixels * self.fps
-            measured_speed_mps = inst_speed_pixels if use_real_world else inst_speed_pixels * self.pixel_to_meter
+            inst_speed_mps = inst_speed_pixels
+        recent_speeds.append(inst_speed_mps)
 
-        # Apply Kalman filtering for smoothing
+        # Average both speed estimates
+        measured_speed_mps = np.mean(recent_speeds)
+
+        # Apply Kalman Filtering for smoothing
         if tracker_id not in self.speed_filters:
             self.speed_filters[tracker_id] = SimpleKalmanFilter(
-                measured_speed_mps, process_variance=0.03, measurement_variance=0.15
+                initial_estimate=measured_speed_mps,
+                process_variance=0.03,      # tune as needed
+                measurement_variance=0.15   # tune as needed
             )
         filtered_speed_mps = self.speed_filters[tracker_id].update(measured_speed_mps)
+
+        # Convert to mph (or desired unit) and store
         self.last_speeds[tracker_id] = convert_speed(filtered_speed_mps, 'mph')
+
         return self.last_speeds[tracker_id]
 
-# -------------------------------------------------------------------
-#                     OCR + PREPROCESS
-# -------------------------------------------------------------------
+
 MORPH_KERNEL = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
 
 def extract_plate(image, box, margin=0.2):
@@ -366,7 +359,7 @@ class ForkliftTracker:
 def parse_arguments():
     parser = argparse.ArgumentParser(description="Forklift Speed + OCR with optimized tracking and speed estimation.")
     parser.add_argument("source_video_path", nargs="?", default=r"test3plate.mp4", help="Path to the source video file", type=str)
-    parser.add_argument("target_video_path", nargs="?", default=r"C:\Users\Kartikey.Tiwari\Downloads\ForkLfit\test_output1.mp4", help="Path to the target video file (output)", type=str)
+    parser.add_argument("target_video_path", nargs="?", default=r"test_output1.mp4", help="Path to the target video file (output)", type=str)
     parser.add_argument("--confidence_threshold", default=0.3, type=float, help="Confidence threshold for YOLO")
     parser.add_argument("--iou_threshold", default=0.7, type=float, help="IOU threshold for NMS")
     parser.add_argument("--target_fps", default=6.0, type=float, help="Target processing FPS (skip frames)")
@@ -396,7 +389,7 @@ def main():
     label_annotator = sv.LabelAnnotator(text_scale=text_scale, text_thickness=thickness, text_position=sv.Position.BOTTOM_CENTER)
     trace_annotator = sv.TraceAnnotator(thickness=thickness, trace_length=int(video_info.fps) * 3, position=sv.Position.BOTTOM_CENTER)
 
-    # Forklift detection zone and expanded polygon by 50 pixels extra horizontally:
+    # Forklift detection zone and expanded polygon by 50 pixels left/right:
     SOURCE = np.array([[568, 310], [1321, 330], [1600, 1002], [264, 976]])
     min_x = np.min(SOURCE[:, 0])
     max_x = np.max(SOURCE[:, 0])
@@ -404,11 +397,9 @@ def main():
     expanded_SOURCE = SOURCE.copy()
     for i in range(len(expanded_SOURCE)):
         if expanded_SOURCE[i, 0] < mid_x:
-            # Previously shifted 50, now subtract a total of 100 pixels
-            expanded_SOURCE[i, 0] -= 100
+            expanded_SOURCE[i, 0] -= 50
         else:
-            # Previously added 50, now add 100 pixels
-            expanded_SOURCE[i, 0] += 100
+            expanded_SOURCE[i, 0] += 50
     polygon_zone = sv.PolygonZone(polygon=expanded_SOURCE)
 
     # Real-world transform
@@ -421,7 +412,7 @@ def main():
 
     # Initialize forklift tracker and speed estimator
     forklift_tracker = ForkliftTracker()
-    speed_estimator = SpeedEstimator(fps=video_info.fps, window_size=5, pixel_to_meter=0.1)
+    speed_estimator = SpeedEstimator(args.target_fps, window_size=5)
     forklift_tracker.set_speed_estimator(speed_estimator)
 
     # Frame processing parameters
@@ -546,19 +537,17 @@ def main():
             annotated_frame = box_annotator.annotate(scene=annotated_frame, detections=forklifts)
             annotated_frame = label_annotator.annotate(scene=annotated_frame, detections=forklifts, labels=labels)
 
-            # Compose overlay text as specified (but print to terminal instead of overlaying on frame)
+            # Compose overlay text as specified
             forklift_count = len(forklift_ids)
             plate_count = len(plates.xyxy)
             stop_count = 1  # (Using a dummy value)
-            overlay_text_line1 = f"{frame_index}: {height}x{width} {forklift_count} forklift{'s' if forklift_count != 1 else ''}, {plate_count} plate{'s' if plate_count != 1 else ''}, {stop_count} stop, {inf_time:.1f}ms"
+            overlay_text_line1 = f"{frame_index}: {height}x{width} {forklift_count} forklift, {plate_count} plate, {stop_count} stop, {inf_time:.1f}ms"
             overlay_text_line2 = f"Speed: {pre_time:.1f}ms preprocess, {inf_time:.1f}ms inference, {post_time:.1f}ms postprocess per image at shape (1, 3, {height}, {width})"
+            # Add terminal output of the overlay text
             
-            # Print performance info to terminal instead of overlaying on the frame
             print(overlay_text_line1)
             print(overlay_text_line2)
             
-            # Remove cv2.putText overlay calls from the frame (i.e. do not add texts to annotated_frame)
-            # ...existing annotation code remains...
             sink.write_frame(annotated_frame)
             cv2.imshow("Forklift Tracking", annotated_frame)
 
